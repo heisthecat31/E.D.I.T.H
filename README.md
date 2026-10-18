@@ -1,5 +1,7 @@
 # E.D.I.T.H
 
+**E**ven **D**ead **I**'m **T**he **H**ero: a joke from *Spider-Man: Far From Home*.
+
 The Christmas CubeSat brought back into Echo VR's live lobby as **E.D.I.T.H**, "the new AI for the
 Echo Construct": she flies, follows, tumbles, stares, throws balls at people who throw her, shoves and
 shuts down bullies, changes face with her mood, and talks (her brain runs on SparkAPI; see `docs/`).

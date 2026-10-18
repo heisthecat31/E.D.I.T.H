@@ -1,5 +1,6 @@
 E.D.I.T.H - the satellite for the Echo VR lobby
 ================================================
+Even Dead I'm The Hero (a joke from Spider-Man: Far From Home).
 
 Install
   1. Extract this whole zip somewhere (not inside the game folder).
