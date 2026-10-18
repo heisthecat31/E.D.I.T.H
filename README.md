@@ -11,6 +11,53 @@ One Edith per match: players with the mod share her through the relay (`docs/net
 |:---:|:---:|:---:|
 | <img src="docs/images/edith_happy.webp" width="260" alt="E.D.I.T.H smiling, her thruster jets out"> | <img src="docs/images/edith_surprised.webp" width="260" alt="E.D.I.T.H surprised, grabbed by a player"> | <img src="docs/images/edith_angry.webp" width="260" alt="E.D.I.T.H angry"> |
 
+## What she can do
+
+- **Fly on her own.** She hovers by her home spot, follows people around, and fires her thruster jets
+  as she moves. Grab her, throw her, or knock her with your head and she tumbles, then turns round and
+  stares at whoever did it.
+- **Talk.** Say her name first: *"Edith, ..."*. She answers small talk, questions about Echo VR and Lone
+  Echo, and a lot of nonsense, in her own voice. If she doesn't know something yet, she says so.
+- **Take orders.** *Follow me*, *come here*, *stay*, *go home*, *spin*, *front flip* / *back flip*,
+  *keep spinning*, *stop*, *push me*, *throw one at me*.
+- **Remember places.** *"Remember this spot as the court"*, then later *"go to the court"*.
+- **Learn.** *"When someone says X, say Y"* teaches her a new answer, and she remembers what you tell her
+  about yourself (likes, dislikes, favourites).
+- **Know who's who.** Everyone with the mod shares one Edith. She knows who is talking to her and who
+  did what to her, and keeps track of each person separately. She never says anyone's name.
+- **Show how she feels.** Her face changes with her mood: happy, surprised, angry, dizzy, hurt, annoyed.
+- **Respect mute.** While you're muted in game she ignores what you say.
+
+## How to treat her
+
+Be nice. She keeps a score for every player:
+
+- Kind words (*"thanks Edith"*, *"you're the best"*) give you a **nice** point.
+- Mean words, and grabbing, throwing, headbutting or hitting her, give you a **mean** point. If you're
+  already on her good side, a grab is fine: she likes being held by a friend.
+- Mean points fade over time (one every 90 seconds). Nice points stay, unless you do three mean things
+  in a row: that wipes them all.
+- Your score is nice points minus mean points. Bumping into a wall by herself doesn't count against
+  anyone.
+
+## What happens if you treat her badly
+
+It escalates, and it's aimed at you, not at whoever is standing nearest:
+
+| What you did | What she does |
+|---|---|
+| Threw her, or headbutted her | Stares you down, then throws a ball at you |
+| Three mean things in a row | Wipes your nice points and throws a ball at you |
+| Two more mean things while your score is below 0 | Shoves you across the room |
+| Score of -5 or worse | Shuts your Echo unit down: you respawn |
+| Score below 0 and you give an order | She refuses the first time; ask again (or say *please*) and she does it, grumbling |
+| Score of -5 or worse with someone nicer around | Ignores you completely |
+| Someone nicer gave her an order in the last minute | Busy with them: yours waits |
+
+She always obeys **stop**. Asking her to shut you down doesn't work: you get a shove instead. To get back
+on her good side, say sorry (it takes a mean point off), be kind to her, and leave her alone for a bit
+while your mean points fade.
+
 ## Layout
 
 | Path | What |
