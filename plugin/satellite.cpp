@@ -446,6 +446,20 @@ constexpr size_t PLAYER_STATE = 0x63fd8, PLAYER_STATE_SIZE = 0x74;
 constexpr int HEAD_POS = 0x1c, HEAD_VEL = 0x40;
 // In local mode (a public lobby whose server doesn't run her) "the player" is YOU: the slot whose
 // head is at the game's audio listener (your ears), not whoever is nearest to her.
+// A player's row (the net game's entrant table, +s*250h: name, user id +180h) and their state record
+// are in different orders online: the row's player index is u16 +178h & 1Fh (CR15NetGame's user id ->
+// player lookup, echovr 0x1401c92d0, and GetUserName read it the same way); the state table is indexed
+// by that, generation at +13Ah. Offline both are 0, so the old row == index guess only broke online:
+// row 0 (you) read someone 48 m away, row 1's state was at your ears (user, 2026-10-18).
+const uint8_t *StateOf(uint8_t *ng, int row) {
+    if (!ng || row < 0 || row >= 32 || *(uint64_t *)(ng + (size_t)row * 0x250 + 0x3c0) == 0) return nullptr;
+    unsigned idx = *(uint16_t *)(ng + (size_t)row * 0x250 + 0x178) & 0x1f;
+    if (idx >= 16) return nullptr;
+    uint16_t value = *(uint16_t *)(ng + 0x138 + idx * 4);
+    if (value == 0xffff) return nullptr;
+    return ng + PLAYER_STATE + (size_t)value * PLAYER_STATE_SIZE;
+}
+
 int TargetSlot();
 bool PlayerAt(int s, float *pos, float *vel);
 bool NearestPlayer(const float *me, float *out, int *slot = nullptr) {
@@ -465,11 +479,11 @@ bool NearestPlayer(const float *me, float *out, int *slot = nullptr) {
     float best = g_local ? 1.5f * 1.5f : 1e30f;
     bool found = false;
     static int logged = 0;
-    for (uint32_t s = 0; s < 16; ++s) {
+    for (uint32_t s = 0; s < 16; ++s) {                       // (s: the player's row, as NameOf / SlotOf)
         g_stage = 10;
-        uint16_t value = *(uint16_t *)(ng + 0x138 + s * 4);
-        if (value == 0xffff || *(uint64_t *)(ng + (size_t)s * 0x250 + 0x3c0) == 0) continue;   // empty (EchoXR-Hands)
-        const float *f = (const float *)(ng + PLAYER_STATE + (size_t)value * PLAYER_STATE_SIZE);
+        const float *f = (const float *)StateOf(ng, (int)s);
+        if (!f) continue;                                     // empty
+        uint16_t value = (uint16_t)(((const uint8_t *)f - (ng + PLAYER_STATE)) / PLAYER_STATE_SIZE);
         static ULONGLONG last_dump = 0;
         if (logged < 2 || (s == 0 && GetTickCount64() - last_dump > 30000)) {
             ++logged;
@@ -494,9 +508,16 @@ bool NearestPlayer(const float *me, float *out, int *slot = nullptr) {
 bool PlayerAt(int s, float *pos, float *vel) {
     uint8_t *ng = g_netgame;
     if (!ng || s < 0 || s >= 16) return false;
-    uint16_t value = *(uint16_t *)(ng + 0x138 + s * 4);
-    if (value == 0xffff || *(uint64_t *)(ng + (size_t)s * 0x250 + 0x3c0) == 0) return false;
-    const uint8_t *f = ng + PLAYER_STATE + (size_t)value * PLAYER_STATE_SIZE;
+    // YOU: the audio listener is your headset, for sure. Online, your own row's state record led her
+    // to someone else ("she is still following someone random", user, 2026-10-18).
+    const uint8_t *f = StateOf(ng, s);
+    if (s == g_own_slot && g_ear_ok) {                        // (your head: the listener, exactly)
+        pos[0] = g_ear[0]; pos[1] = g_ear[1]; pos[2] = g_ear[2];
+        if (f) memcpy(vel, f + HEAD_VEL, 12);
+        else vel[0] = vel[1] = vel[2] = 0;
+        return true;
+    }
+    if (!f) return false;
     memcpy(pos, f + HEAD_POS, 12);
     memcpy(vel, f + HEAD_VEL, 12);
     return fabsf(pos[0]) + fabsf(pos[1]) + fabsf(pos[2]) > 1e-4f;
@@ -1737,6 +1758,16 @@ int LocalSlotByBody(uint8_t *ng, const SlotName *names, int n) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
+// (diagnostic) row s's head from the state table and from its body (POD only: runs under __try)
+void RowHeads(uint8_t *ng, int s, float *sp, bool &st, float *bp, bool &body) {
+    __try {
+        const uint8_t *f = StateOf(ng, s);
+        if (f) { memcpy(sp, f + HEAD_POS, 12); st = true; }
+        const uint64_t *raw = (const uint64_t *)(ng + (size_t)s * 0x250 + 0x180);
+        body = PlayerPos(raw[0], raw[1], bp) || PlayerPos(raw[1], raw[0], bp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 void UpdateNet(uint8_t *ng) {
     static ULONGLONG last = 0;
     ULONGLONG now = GetTickCount64();
@@ -1767,6 +1798,26 @@ void UpdateNet(uint8_t *ng) {
         return;
     }
     if (me != said_me) { said_me = me; Log("edith net: you are '%s' (%s)", me.c_str(), g_my_name[0] ? "EDITH.ini my_name" : how); }
+    // (diagnostic, every 10 s for 2 minutes after you're known) who is where: each row's head from the
+    // state table and from its body (echo unit), against your ears. Online the rows and the state table
+    // may not line up ("she is still following someone random").
+    static ULONGLONG known_at = 0, last_table = 0;
+    if (!known_at) known_at = now;
+    if (now - known_at < 120000 && now - last_table >= 10000) {
+        last_table = now;
+        Log("players (row: name, state head, body head, from your ears; ears %s%.2f %.2f %.2f):", g_ear_ok ? "" : "unknown ",
+            g_ear[0], g_ear[1], g_ear[2]);
+        for (int i = 0; i < n; ++i) {
+            int s = names[i].slot;
+            float sp[3] = { 0, 0, 0 }, bp[3] = { 0, 0, 0 };
+            bool st = false, body = false;
+            RowHeads(ng, s, sp, st, bp, body);
+            float de = sqrtf((sp[0] - g_ear[0]) * (sp[0] - g_ear[0]) + (sp[1] - g_ear[1]) * (sp[1] - g_ear[1]) + (sp[2] - g_ear[2]) * (sp[2] - g_ear[2]));
+            float db = sqrtf((bp[0] - g_ear[0]) * (bp[0] - g_ear[0]) + (bp[1] - g_ear[1]) * (bp[1] - g_ear[1]) + (bp[2] - g_ear[2]) * (bp[2] - g_ear[2]));
+            Log("  %2d %-20s state %s(%.2f %.2f %.2f) %.1f m | body %s(%.2f %.2f %.2f) %.1f m%s", s, names[i].name, st ? "" : "none ",
+                sp[0], sp[1], sp[2], de, body ? "" : "none ", bp[0], bp[1], bp[2], db, s == g_own_slot ? "  <- you" : "");
+        }
+    }
     strncpy_s(g_me, me.c_str(), _TRUNCATE);
     if (!g_network) return;
     std::vector<std::string> others;
