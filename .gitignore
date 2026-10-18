@@ -1,0 +1,33 @@
+# build output: level builds, her assets, textures, voice pack, plugin binaries (2+ GB)
+out/
+obj/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# release zips (rebuilt by tools/make_release.py; too big for git)
+release/*.zip
+
+# extracted game files and third-party binaries: not ours to publish
+tools/oodle/
+ai/library/recordings/*.pcm
+*.dll
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# logs and scratch
+*.log
+*.tmp
+*.bak
+Thumbs.db
+desktop.ini
+
+# local launchers: hardcoded paths to this machine's Python and folders
+run_*.bat
+run_*.ps1

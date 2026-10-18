@@ -1,0 +1,106 @@
+{
+ "_about": "Her real 2017 lines: text -> takes (recordings/*.pcm, 24 kHz mono int16). Made by add_recordings.py; the voice plays these instead of the synthesized voice.",
+ "lines": {
+  "Welcome. Happy holidays.": [
+   "cubie_003.pcm"
+  ],
+  "Wouldn't you say this holiday is stunning?": [
+   "cubie_005.pcm"
+  ],
+  "Say cheese!": [
+   "cubie_006.pcm",
+   "cubie_013.pcm",
+   "cubie_029.pcm"
+  ],
+  "What? Hey!": [
+   "cubie_009.pcm"
+  ],
+  "Hello!": [
+   "cubie_010.pcm",
+   "cubie_021.pcm"
+  ],
+  "Hey, I'm not a snow globe.": [
+   "cubie_012.pcm",
+   "cubie_061.pcm"
+  ],
+  "Very nice.": [
+   "cubie_015.pcm"
+  ],
+  "What sport do you play after wrapping presents? Boxing!": [
+   "cubie_016.pcm"
+  ],
+  "With some help, I could probably cook some hamburgers here.": [
+   "cubie_018.pcm"
+  ],
+  "Run, run, run as fast as you can.": [
+   "cubie_019.pcm"
+  ],
+  "Who wants snow cones?": [
+   "cubie_020.pcm",
+   "cubie_071.pcm"
+  ],
+  "Hello.": [
+   "cubie_023.pcm"
+  ],
+  "Nice to meet you.": [
+   "cubie_027.pcm"
+  ],
+  "Well, you look festive.": [
+   "cubie_032.pcm"
+  ],
+  "Ooh, so cozy.": [
+   "cubie_034.pcm"
+  ],
+  "Oh hi!": [
+   "cubie_036.pcm"
+  ],
+  "What do you call a snowman by a fireplace? A puddle!": [
+   "cubie_040.pcm"
+  ],
+  "Chill out.": [
+   "cubie_042.pcm",
+   "cubie_068.pcm"
+  ],
+  "Think fast.": [
+   "cubie_047.pcm",
+   "cubie_058.pcm"
+  ],
+  "Hey!": [
+   "cubie_049.pcm"
+  ],
+  "Ooh, I give it a ten.": [
+   "cubie_054.pcm"
+  ],
+  "I'll just leave this here.": [
+   "cubie_060.pcm",
+   "cubie_072.pcm"
+  ],
+  "Oh, uh, hi.": [
+   "cubie_064.pcm"
+  ],
+  "Mmm, frosty.": [
+   "cubie_067.pcm"
+  ],
+  "Are you ready to deck some halls?": [
+   "cubie_073.pcm"
+  ],
+  "Hi, how's it going?": [
+   "cubie_079.pcm"
+  ],
+  "Hey, come on!": [
+   "cubie_082.pcm"
+  ],
+  "Oh my.": [
+   "cubie_088.pcm"
+  ],
+  "Aww, you look great!": [
+   "cubie_095.pcm"
+  ],
+  "Hello?": [
+   "cubie_002.pcm"
+  ],
+  "Presto!": [
+   "cubie_077.pcm"
+  ]
+ }
+}
