@@ -7,6 +7,10 @@ Echo Construct": she flies, follows, tumbles, stares, throws balls at people who
 shuts down bullies, changes face with her mood, and talks (her brain runs on SparkAPI; see `docs/`).
 One Edith per match: players with the mod share her through the relay (`docs/networkplan.md`).
 
+| Happy | Surprised | Angry |
+|:---:|:---:|:---:|
+| <img src="docs/images/edith_happy.webp" width="260" alt="E.D.I.T.H smiling, her thruster jets out"> | <img src="docs/images/edith_surprised.webp" width="260" alt="E.D.I.T.H surprised, grabbed by a player"> | <img src="docs/images/edith_angry.webp" width="260" alt="E.D.I.T.H angry"> |
+
 ## Layout
 
 | Path | What |
