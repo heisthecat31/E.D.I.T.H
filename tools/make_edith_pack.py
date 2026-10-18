@@ -43,6 +43,9 @@ def main() -> int:
     ap.add_argument("--build", default=str(HERE / "out" / "build" / "mpl_lobby_b2"))
     ap.add_argument("--out", default=str(HERE / "out" / "E.D.I.T.H" / "mpl_lobby_b2.edith"))
     ap.add_argument("--install", nargs="*", default=[], help="plugin folders (<plugins>\\E.D.I.T.H) to copy it to")
+    ap.add_argument("--include-types", nargs="*", default=[],
+                    help="resource types (e.g. CR15NetIdCRWin10) packed even when they match stock: they then "
+                         "override an install whose own data differs (a repack that still has her old rows)")
     a = ap.parse_args()
     from le_symbol_names import symbol64
     import rad_archive_tool
@@ -52,9 +55,10 @@ def main() -> int:
     stage = work / "stage" / f"0x{h:016X}"
     new = changed = 0
     keys = []                                           # (type, name) of every packed resource
+    forced = {int(symbol64(t), 16) for t in a.include_types}
     for f in sorted(build.glob("*/*")):
         ref = STOCK / f.parent.name / f.name
-        if ref.exists() and filecmp.cmp(f, ref, shallow=False):
+        if ref.exists() and filecmp.cmp(f, ref, shallow=False) and int(f.parent.name, 16) not in forced:
             continue
         keys.append((int(f.parent.name, 16), int(f.name, 16)))
         changed += ref.exists()

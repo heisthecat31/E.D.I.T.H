@@ -153,6 +153,7 @@ void SendJson(const std::string &json) { Send(false, json); }
 std::mutex g_vmx;
 std::condition_variable g_vcv;
 std::deque<J> g_replies;                            // her lines to play
+std::deque<bool> g_shared;                          // (each: the host's line, already shared: don't pass it on)
 std::atomic<bool> g_speaking{ false };
 
 void Reply(const J &m) {
@@ -172,7 +173,7 @@ void Reply(const J &m) {
     }
     if (!m.str("say").empty()) {
         std::lock_guard<std::mutex> lk(g_vmx);
-        if (g_replies.size() < 8) g_replies.push_back(m);
+        if (g_replies.size() < 8) { g_replies.push_back(m); g_shared.push_back(false); }
         g_vcv.notify_one();
     }
 }
@@ -198,7 +199,8 @@ void Got(bool binary, const std::string &msg) {
         const J *id = m.get("id");
         std::lock_guard<std::mutex> lk(g_rmx);
         auto it = g_renders.find(id && id->t == J::NUM ? (uint32_t)id->n : 0);
-        if (it != g_renders.end()) it->second.push_back(std::string());   // (done)
+        const J *okf = m.get("ok");                           // (done: "" complete, "" not)
+        if (it != g_renders.end()) it->second.push_back(okf && okf->t == J::BOOL && !okf->b ? std::string() : std::string(1, ''));
         g_rcv.notify_all();
     } else if (t == "hi") {
         const J *stt = m.get("stt"), *tts = m.get("tts");
@@ -343,6 +345,8 @@ bool Mine(const std::string &text, const std::string &key, const std::string &al
     return secs >= 0.12 * Words(text);
 }
 
+// A pack file (path, its key), or a line to stream (text, the key it's kept under once streamed: the
+// fallback voice's, as the brain renders it with that voice).
 struct Item { bool file; std::string path_or_text, key; };
 
 // What to play (edith_ears.py Voice.plan): her whole line, all its sentences in her voice, the fallback
@@ -369,10 +373,10 @@ std::vector<Item> Plan(const J &m) {
     for (auto &p : parts) {
         if (Mine(p[0], p[1], p[2], path)) { out.push_back({ true, path, p[1] }); any = true; }
         else if (FileOf(p[2], path, b)) { out.push_back({ true, path, p[2] }); any = true; }
-        else out.push_back({ false, p[0], "" });
+        else out.push_back({ false, p[0], p[2] });
     }
     if (any) return out;
-    return { { false, say, "" } };                                  // none of it in the pack: one stream
+    return { { false, say, alt } };                                 // none of it in the pack: one stream
 }
 
 // Her speaker takes the PCM (waits for room in its ring; gives up after a few seconds without her).
@@ -389,14 +393,36 @@ bool Push(const char *data, size_t bytes) {
     return true;
 }
 
+// A streamed line into the pack folder under its key, so the next time it plays from there (each
+// game streams a new line once). Only a whole render; written to a temp file, then renamed.
+void Keep(const std::string &key, const std::string &pcm, bool complete) {
+    std::string path;
+    long long b;
+    if (!complete || pcm.size() < 4800 || key.size() != 20 || g_voice_dir.empty() || FileOf(key, path, b)) return;
+    for (char ch : key)
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return;
+    path = g_voice_dir + key + ".pcm";
+    std::string tmp = path + ".part";
+    FILE *f = nullptr;
+    if (fopen_s(&f, tmp.c_str(), "wb") || !f) return;
+    bool ok = fwrite(pcm.data(), 1, pcm.size(), f) == pcm.size();
+    fclose(f);
+    if (ok && MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        ELOG("ears: kept the streamed line in the pack (%s, %.1f s)", key.c_str(), pcm.size() / 2.0 / RATE);
+    else DeleteFileA(tmp.c_str());
+}
+
 void VoiceThread() {
     for (;;) {
         J m;
+        bool shared;
         {
             std::unique_lock<std::mutex> lk(g_vmx);
             g_vcv.wait(lk, [] { return !g_replies.empty(); });
             m = g_replies.front();
             g_replies.pop_front();
+            shared = g_shared.front();
+            g_shared.pop_front();
         }
         std::vector<Item> items = Plan(m);
         std::string how, keys;
@@ -408,7 +434,19 @@ void VoiceThread() {
         ELOG("ears: '%s' <- %s", m.str("say").c_str(), how.c_str());
         g_speaking = true;
         SendJson("{\"t\":\"speaking\",\"on\":true}");
-        if (!keys.empty()) H.voice_keys(keys.c_str());          // the other games play the same pack files
+        if (!shared) {                                         // the other games play it too
+            std::string line = "{\"say\":\"" + Esc(m.str("say")) + "\",\"key\":\"" + Esc(m.str("key")) +
+                               "\",\"alt\":\"" + Esc(m.str("alt")) + "\",\"parts\":[";
+            const J *ps = m.get("parts");
+            if (ps && ps->t == J::ARR)
+                for (size_t i = 0; i < ps->a.size(); ++i) {
+                    const J &p = ps->a[i];
+                    if (p.t != J::ARR || p.a.size() < 3) continue;
+                    line += std::string(i ? "," : "") + "[\"" + Esc(p.a[0].s) + "\",\"" + Esc(p.a[1].s) + "\",\"" + Esc(p.a[2].s) + "\"]";
+                }
+            line += "]}";
+            H.voice_line(keys.c_str(), line.c_str());
+        }
         bool ok = true;
         for (auto &it : items) {
             if (!ok) break;
@@ -432,6 +470,8 @@ void VoiceThread() {
             if (!g_up) { ELOG("ears: can't voice '%s' (no pack line, no brain)", it.path_or_text.c_str()); continue; }
             SendJson("{\"t\":\"render\",\"id\":" + std::to_string(id) + ",\"text\":\"" + Esc(it.path_or_text) + "\"}");
             ELOG("ears: streaming '%s' (not in the pack)", it.path_or_text.c_str());
+            std::string all;                                   // (kept: next time it's in the pack)
+            bool complete = false;
             for (;;) {
                 std::string piece;
                 {
@@ -441,10 +481,15 @@ void VoiceThread() {
                     g_renders[id].pop_front();
                 }
                 if (piece.empty()) break;
+                if (piece.size() == 1 && piece[0] == '') { complete = true; break; }
+                all += piece;
                 if (!(ok = Push(piece.data(), piece.size()))) break;
             }
-            std::lock_guard<std::mutex> lk(g_rmx);
-            g_renders.erase(id);
+            {
+                std::lock_guard<std::mutex> lk(g_rmx);
+                g_renders.erase(id);
+            }
+            Keep(it.key, all, complete);
         }
         if (!ok) ELOG("ears: her speaker isn't playing: line dropped");
         for (int k = 0; k < 600 && H.speaker_pending() > 0; ++k) Sleep(20);   // let it play out (12 s at most)
@@ -661,6 +706,15 @@ void Ears_Voip(const char *name, uint32_t rate, const int16_t *pcm, size_t n) {
     if (g_pq.size() > 400) return;                             // (falling behind: drop, never block Wwise)
     g_pq.push_back({ name, rate, std::vector<int16_t>(pcm, pcm + n) });
     g_pcv.notify_one();
+}
+
+void Ears_PlayLine(const char *line_json) {
+    J m;
+    const char *p = line_json;
+    if (!line_json || !Parse(p, line_json + strlen(line_json), m) || m.t != J::OBJ || m.str("say").empty()) return;
+    std::lock_guard<std::mutex> lk(g_vmx);
+    if (g_replies.size() < 8) { g_replies.push_back(m); g_shared.push_back(true); }
+    g_vcv.notify_one();
 }
 
 bool Ears_Speaking() { return g_speaking; }

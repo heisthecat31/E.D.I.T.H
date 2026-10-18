@@ -2116,6 +2116,8 @@ void PollSelf() {
     }
 }
 
+std::string JObj(const std::string &s, const char *key);   // (below)
+
 // Every tick: what the relay forwarded.
 void TakeNet() {
     bool host = !strcmp(g_net_role, "host");
@@ -2145,8 +2147,12 @@ void TakeNet() {
             if (g_touches.size() < 32) g_touches.push_back(tc);
         } else if (t == "ctl" && JStr(m.data, "to") == g_me) {
             DoCtl(JStr(m.data, "do"), JNum(m.data, "speed", 0));
-        } else if (t == "voice" && !host && from == g_net_host) { // the host's Edith said a pack line
-            PlayPack(JStr(m.data, "keys"));
+        } else if (t == "voice" && !host && from == g_net_host) { // the host's Edith said something
+            std::string line = g_ears_dll ? JObj(m.data, "line") : std::string();
+            Log("voice from %s: %s", from.c_str(), !line.empty() ? "the whole line (built-in ears play it)"
+                : g_ears_dll ? "no line in it: pack keys only" : "pack keys (no built-in ears)");
+            if (!line.empty()) Ears_PlayLine(line.c_str());   // built-in ears: the whole line (pack or streamed)
+            else PlayPack(JStr(m.data, "keys"));              // else the pack files it played
         } else if (t == "snow" && !host && from == g_net_host) {  // ...threw a ball
             float at[3], v[3];
             if (JVec(m.data, "pos", at) && JVec(m.data, "vel", v)) LaunchSnow((unsigned)JNum(m.data, "k", 0), at, v);
@@ -2386,6 +2392,41 @@ void ReclaimHer(ULONGLONG now) {
     since = now;
 }
 
+// Her body off the network in a public lobby. There the server doesn't have her: her actor, her balls
+// and her face ports exist only in games with the mod. Their R14NetPhysics components still made the
+// game send the server physics and ownership for actors it doesn't know (moved every frame, teleported,
+// grabbed, thrown); timeout disconnects began with her in public lobbies (11 on 2026-10-18 on five
+// servers, ~0 the days before; the server simply stopped sending). On a client steering her itself
+// (local=1, not authority) her net physics and her balls' are disabled with a category bit of ours
+// (DisableComponent, component system vtable +208h: ORs it into the slot's mask and calls
+// OnComponentDisabled; +200h clears). Her real physics (CPhysicsCS) is separate: she still flies,
+// collides and can be grabbed. With a server that runs her (local=0) nothing changes.
+constexpr uint16_t NET_OFF = 0x8000;                         // our disabling category
+using disable_fn = void(__fastcall *)(void *cs, uint32_t handle, uint16_t categories);
+void KeepOffNetwork(ULONGLONG now) {
+    static ULONGLONG last = 0;
+    static void *said_for = nullptr;
+    if (!g_local || g_authority || !g_her.net || now - last < 2000) return;
+    last = now;
+    uint8_t *cs = g_her.net;
+    void **vt = *(void ***)cs;
+    int off = 0, already = 0;
+    for (unsigned k = 0; k <= g_snow_count && k <= 16; ++k) {
+        uint64_t actor = k == 0 ? HER_ACTOR : SnowActor(k - 1);
+        uint32_t h = AnyInstance(cs, actor);
+        if (h == 0xffffffffu) continue;
+        uint16_t slot = *(uint16_t *)(*(uint8_t **)(cs + 0xc8) + (size_t)(h & 0xffff) * 4);
+        uint16_t mask = *(uint16_t *)(*(uint8_t **)(cs + 0xe0) + (size_t)slot * 2);
+        if (mask & NET_OFF) { ++already; continue; }
+        ((disable_fn)vt[0x208 / 8])(cs, h, NET_OFF);
+        ++off;
+    }
+    if (off || said_for != cs) {
+        said_for = cs;
+        Log("off the network (public lobby): %d net physics component(s) disabled now, %d already (her and her balls)", off, already);
+    }
+}
+
 // Your voice chat mute, for the companion: muted in game = she doesn't hear your mic either (user,
 // 2026-10-18). R15NetVoipMuteSelfNode (registered at 0x140f4eb1a) queues 0x1401b24a0(netgame, mute),
 // which sets / clears bit 38 of the u64 at *(netgame + 2DA0h) and tells voice chat. Sent as
@@ -2426,6 +2467,7 @@ void __fastcall Hooked_NetGameUpdate(uint8_t *ng) {
     __try {
         ReadMute(ng);                                         // muted in game: she doesn't hear you
         ReclaimHer(now);                                      // a server keeps her body (net physics owner)
+        KeepOffNetwork(now);                                  // a public lobby's server doesn't have her
         PollSelf();                                           // shoves / shutdowns for your own body
         if (g_network) TakeNet();                             // one Edith per match (docs/networkplan.md)
         static bool was_puppet = false;
@@ -2825,7 +2867,33 @@ void EarsOrder(const char *order) {
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
     sendto(sk, o.c_str(), (int)o.size(), 0, (sockaddr *)&a, sizeof a);
 }
-void EarsVoiceKeys(const char *keys) { SendVoice(keys); }
+// Her line for the room (the host only): the pack keys for games without built-in ears, and the whole
+// line for those with them, so a line the pack lacks (streamed) reaches everyone, not just the host's
+// game ("the audio for capital of france isn't being sent to me", user, 2026-10-18).
+void EarsVoiceLine(const char *keys, const char *line_json) {
+    if (strcmp(g_net_role, "host") || !VoiceKeysOk(keys) || strlen(keys) > 400) return;
+    std::string m = std::string("{\"t\":\"voice\",\"keys\":\"") + keys + "\",\"line\":" + line_json + "}";
+    if (m.size() < 3800) EdithNet_SendText(m);
+    else if (keys[0]) SendVoice(keys);                        // (too long for the relay: the pack part only)
+    Log("voice -> room: %.60s (%s, %zu bytes)", line_json, keys[0] ? "pack keys too" : "no pack keys", m.size());
+}
+// The raw JSON object after "key": in a relay message (the host's line).
+std::string JObj(const std::string &s, const char *key) {
+    std::string k = std::string("\"") + key + "\":{";
+    size_t p = s.find(k);
+    if (p == std::string::npos) return "";
+    p += k.size() - 1;
+    int depth = 0;
+    bool str = false;
+    for (size_t i = p; i < s.size(); ++i) {
+        char c = s[i];
+        if (str) { if (c == '\\') ++i; else if (c == '"') str = false; continue; }
+        if (c == '"') str = true;
+        else if (c == '{') ++depth;
+        else if (c == '}' && --depth == 0) return s.substr(p, i - p + 1);
+    }
+    return "";
+}
 bool EarsSpeakerPush(const int16_t *pcm, size_t n) {
     LONG64 wr = g_wr;
     if (!g_spk.playing || (size_t)(wr - g_rd) + n > RING - VOICE_RATE / 10) return false;   // (no room / no speaker)
@@ -2844,7 +2912,7 @@ void StartEars() {
     h.has_ears = EarsHasEars;
     h.me = EarsMe;
     h.order = EarsOrder;
-    h.voice_keys = EarsVoiceKeys;
+    h.voice_line = EarsVoiceLine;
     h.speaker_push = EarsSpeakerPush;
     h.speaker_pending = EarsSpeakerPending;
     Ears_Start(h, g_brain_url, g_voice_dir, g_mic);

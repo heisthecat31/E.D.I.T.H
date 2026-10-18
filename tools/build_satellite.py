@@ -47,6 +47,11 @@ NCA_TRANSFORM, NCA_MODEL = 0xABFE651C8D260515, 0x38EE951A26FB816A           # 20
 #: and sync grab). Their flag words changed since 2018, so they come from a live prop.
 PHYSICS_TABLES = ["CPhysicsCRWin10", "CR15NetPhysicsCRWin10", "CR15TouchInteractCRWin10",
                   "CR15NetTouchInteractCRWin10", "CR15NetIdCRWin10"]   # not CR15SyncGrabCR: the disc's own
+#: the networked ones: on a public lobby the server doesn't have her or her balls, so a client
+#: owning them streamed physics / touch updates for objects the server never heard of, and echovrce's
+#: matchmaker kicked the session (timeout disconnects, user 2026-10-18). She is synced between mod
+#: players by the relay instead; --networked puts them back.
+NET_TABLES = ["CR15NetPhysicsCRWin10", "CR15NetTouchInteractCRWin10", "CR15NetIdCRWin10"]
 HER_ASSETS = HERE / "out" / "her_assets"     # tools/port_assets.py output
 HER_MODEL_CR18 = HERE / "out" / "xmas2018" / "mpl_lobby_b2_xmas" / "3de813820d0b4719" / "6daa6d98d9354ba5"
 
@@ -513,6 +518,8 @@ def main() -> int:
                     help="actor whose physics / grab / network rows she gets (live conventions for a "
                          "grabbable networked prop; the lobby disc). '' = none")
     ap.add_argument("--physics-tables", nargs="*", default=PHYSICS_TABLES)
+    ap.add_argument("--networked", action="store_true",
+                    help="keep her / her balls' net physics, net touch and net id rows (default: local only)")
     ap.add_argument("--scale", type=float, help="uniform scale (default: the donor's)")
     ap.add_argument("--rot", type=float, nargs=4, help="rotation quaternion x y z w")
     ap.add_argument("--launch", action="store_true", help="smoke test: launch, screenshot, close")
@@ -645,6 +652,9 @@ def main() -> int:
     if a.her_model and a.physics_donor:          # collision, grab and network: a live prop's rows
         pd = int(a.physics_donor, 16)
         for t in a.physics_tables:
+            if t in NET_TABLES and not a.networked:
+                print(f"{t}: left out (local only)")
+                continue
             f = path(t)
             if not f.is_file() or struct.pack("<Q", pd) not in f.read_bytes():
                 print(f"{t}: no rows of {pd:016x}")
@@ -693,6 +703,8 @@ def main() -> int:
             tr.add_entry(c)
         p.write_bytes(tr.to_bytes())
         done = {th("CActorDataResourceWin10"), th("CTransformCRWin10")}
+        if not a.networked:                       # local only: no net rows for her balls either
+            done |= {th(t) for t in NET_TABLES}
         for td in sorted(staged.iterdir()):
             f = td / lvl
             if td.name in done or not f.is_file() or struct.pack("<Q", src) not in f.read_bytes():

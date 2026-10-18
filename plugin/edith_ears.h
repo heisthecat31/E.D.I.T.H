@@ -17,7 +17,10 @@ struct EarsHost {
     bool (*has_ears)(const char *name);         // that player's own game hears them (the room's ai list)
     const char *(*me)();                        // your display name ("" until known)
     void (*order)(const char *order);           // a reply's order / face, into the DLL
-    void (*voice_keys)(const char *keys);       // her line from the pack: the other games play it too
+    // her line, for the other games: the pack keys it played (older games play those) and the whole
+    // line as JSON {"say","key","alt","parts"} (games with built-in ears play it themselves: pack or
+    // streamed, so a line the pack lacks reaches them too)
+    void (*voice_line)(const char *keys, const char *line_json);
     bool (*speaker_push)(const int16_t *pcm, size_t n);   // into her speaker (false: no room right now)
     size_t (*speaker_pending)();                // samples still queued in her speaker
 };
@@ -31,6 +34,9 @@ void Ears_Line(const char *line);
 
 // Another player's voice, as Wwise played it (called on Wwise's audio thread: copies and returns).
 void Ears_Voip(const char *name, uint32_t rate, const int16_t *pcm, size_t n);
+
+// The host's line on another game: played here like her own reply (pack, else streamed from the brain).
+void Ears_PlayLine(const char *line_json);
 
 // Her line is playing (the mic is deaf meanwhile).
 bool Ears_Speaking();
