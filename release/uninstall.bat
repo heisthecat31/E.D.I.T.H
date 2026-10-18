@@ -2,6 +2,8 @@
 rem E.D.I.T.H uninstaller: finds Echo VR the same way as install.bat and removes EDITH.dll, EDITH.ini,
 rem her map package and her voice. The plugin loader (dbgcore.dll) stays: other mods use it (user).
 setlocal EnableExtensions EnableDelayedExpansion
+rem Windows' own tools by full path: a PATH with Git's Unix tools first made "find /i" crawl the I: drive
+set "SYS=%SystemRoot%\System32"
 title E.D.I.T.H uninstaller
 echo.
 echo   E.D.I.T.H uninstaller
@@ -12,7 +14,7 @@ set "GAME="
 set "SPARK=%APPDATA%\IgniteVR\Spark\settings.json"
 set "SPARKPATH="
 if exist "%SPARK%" (
-    for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "try { (Get-Content -Raw -LiteralPath $env:SPARK | ConvertFrom-Json).echoVRPath } catch { }"`) do set "SPARKPATH=%%P"
+    for /f "usebackq delims=" %%P in (`%SYS%\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { (Get-Content -Raw -LiteralPath $env:SPARK | ConvertFrom-Json).echoVRPath } catch { }"`) do set "SPARKPATH=%%P"
 )
 if defined SPARKPATH (
     call :resolve "!SPARKPATH!"
@@ -20,7 +22,7 @@ if defined SPARKPATH (
         echo   Spark says Echo VR is here:
         echo     !FOUND!
         echo.
-        choice /c YN /m "  Is this the right Echo VR"
+        "%SYS%\choice.exe" /c YN /m "  Is this the right Echo VR"
         if !errorlevel! equ 1 set "GAME=!FOUND!"
         echo.
     )
@@ -46,7 +48,7 @@ if not exist "%P%\EDITH.dll" if not exist "%P%\EDITH\" (
     echo   E.D.I.T.H isn't installed in %GAME%.
     goto :end
 )
-tasklist /fi "imagename eq echovr.exe" 2>nul | find /i "echovr.exe" >nul
+"%SYS%\tasklist.exe" /fi "imagename eq echovr.exe" /nh 2>nul | "%SYS%\findstr.exe" /i /c:"echovr.exe" >nul
 if not errorlevel 1 (
     echo   Echo VR is running. Close it, then press a key.
     pause >nul

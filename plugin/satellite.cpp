@@ -26,10 +26,15 @@
 #include <stdlib.h>
 #include <string>
 #include <vector>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
 #include "detours.h"
 #include "logdir.h"
 #include "edith_net.h"
 #include "edith_pack.h"
+#include "edith_ears.h"
 
 namespace {
 
@@ -63,9 +68,28 @@ struct SlotName { int slot; char name[64]; };
 SlotName g_names[32];
 int g_nnames = 0, g_own_slot = -1;
 char g_me[64] = "";
+//: Does this player run E.D.I.T.H? (her room members, or you). She ignores everyone else (user).
+bool InRoom(const char *name) {
+    if (!name || !name[0]) return false;
+    if (!strcmp(name, g_me)) return true;
+    size_t n = strlen(name);
+    for (const char *p = g_net_members; *p;) {
+        const char *e = strchr(p, ',');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == n && !strncmp(p, name, n)) return true;
+        if (!e) break;
+        p = e + 1;
+    }
+    return false;
+}
 //: who she is about: the order's player ("follow Bob", "come" from Bob) or else her favourite (the
 //: companion's "favour <name>": whoever has been nicest to her). Empty = you (local mode's rule).
 char g_favour[64] = "";
+//: whoever is talking to her: she turns to them for a moment, whatever their score ("lookat <s> <name>",
+//: user 2026-10-18: "look at the person currently talking to her, even if they have a low score")
+char g_look[64] = "";
+ULONGLONG g_look_until = 0;
+char g_voice_dir[MAX_PATH] = "";                                // <plugins>\EdithVoice\ (her voice pack)
 int SlotOf(const char *name) {
     if (!name || !name[0]) return -1;
     for (int i = 0; i < g_nnames; ++i)
@@ -635,6 +659,8 @@ void SetSnowVelocity(unsigned k, const float *v) {
     Defer(queue, g_her.physics, g_set_angular, h, zero);
 }
 
+void SendSnow(unsigned k, const float *at, const float *v);   // (the relay, below)
+
 // Throw at player slot `s`, leading their head by its velocity over the flight time.
 bool ThrowSnowball(const Pose &me, int s) {
     float tp[3], tv[3];
@@ -659,7 +685,19 @@ bool ThrowSnowball(const Pose &me, int s) {
     b.thrown = GetTickCount64();
     Log("snowball %u (actor %016llx) at (%.2f %.2f %.2f) -> player %d at (%.2f %.2f %.2f), %.2f m, lead %.2f s",
         k, SnowActor(k), at[0], at[1], at[2], s, tp[0], tp[1], tp[2], Len(d), t);
+    SendSnow(k, at, b.v);                                     // the other players see it too
     return true;
+}
+
+// A ball the host threw, on a puppet: its own copy of ball k, same start and velocity (each game
+// has its own ball actors; the server doesn't know them). Users: "they can't see her throw balls".
+void LaunchSnow(unsigned k, const float *at, const float *v) {
+    if (!g_snow_count || !WorldTeleport || !HerAlive() || k >= g_snow_count) return;
+    Snow &b = g_snow[k];
+    memcpy(b.v, v, 12);
+    Place(k, at);
+    b.launch = 2;
+    b.thrown = GetTickCount64();
 }
 
 // --- voice orders (ai/satellite_ai.py, the local AI companion) -------------------------------
@@ -703,14 +741,18 @@ constexpr float PUSH_MAX = 15.0f;
 SOCKET g_sock = INVALID_SOCKET;
 sockaddr_in g_ai = {};
 
+bool g_ears_dll = false;                                      // EDITH.ini ears=dll: her ears are built in (edith_ears.cpp)
+
 void Event(const char *fmt, ...) {
-    if (g_sock == INVALID_SOCKET) return;
     char buf[512];
     va_list a;
     va_start(a, fmt);
     int n = vsnprintf(buf, sizeof buf, fmt, a);
     va_end(a);
-    if (n > 0) sendto(g_sock, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1, 0, (sockaddr *)&g_ai, sizeof g_ai);
+    if (n <= 0) return;
+    if (g_ears_dll) Ears_Line(buf);                           // up to the brain
+    if (g_sock != INVALID_SOCKET)                             // (and to a Python companion, if one runs)
+        sendto(g_sock, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1, 0, (sockaddr *)&g_ai, sizeof g_ai);
 }
 
 void OpenOrders() {
@@ -733,6 +775,8 @@ void OpenOrders() {
 }
 
 bool SetFace(const char *name, float seconds);                // her mood faces (below)
+void SendVoice(const char *keys);                             // her voice on the other players' games (below)
+void SendFace(const char *name, float seconds);               // ...and her face
 void ForwardHeard(const char *text);                          // (Edith on the network, below)
 bool SendCtl(const char *to, const char *what, float speed, const float *from);
 
@@ -750,6 +794,19 @@ void PollOrders(const Pose &me) {
         if (const char *t = strstr(buf, "to=")) sscanf_s(t + 3, "%63s", g_orders.to, (unsigned)sizeof g_orders.to);
         if (!strncmp(buf, "heard ", 6)) {                     // a puppet's companion: speech for the host
             ForwardHeard(buf + 6);
+            continue;
+        }
+        if (!strncmp(buf, "lookat ", 7)) {                    // "lookat <seconds> <name, may have spaces>"
+            float s = 0;
+            int used = 0;
+            if (sscanf_s(buf + 7, "%f %n", &s, &used) >= 1 && used > 0) {
+                strncpy_s(g_look, buf + 7 + used, _TRUNCATE);
+                g_look_until = GetTickCount64() + (ULONGLONG)(fminf(fmaxf(s, 0.5f), 30.0f) * 1000.0f);
+            }
+            continue;
+        }
+        if (!strncmp(buf, "voice ", 6)) {                     // the host's line from the pack: the others play it too
+            SendVoice(buf + 6);
             continue;
         }
         if (!strncmp(buf, "favour ", 7) || !strcmp(buf, "favour")) {
@@ -818,6 +875,7 @@ void PollOrders(const Pose &me) {
                 Event("error face %s", buf + 5);
                 continue;
             }
+            SendFace(name, s);                                // the other players see it too
         }
         else if (strncmp(buf, "status", 6)) { Log("orders: unknown \"%s\"", buf); Event("error unknown order %s", buf); continue; }
         Log("order \"%s\" (%s -> %s)", buf, OrderName(was), OrderName(g_orders.order));
@@ -1166,6 +1224,10 @@ void Tick() {
             g_brain.cause = hd < HEADBUTT_DIST ? HEADBUTT : BUMP;
             g_brain.wall = false;
             g_brain.culprit = hslot;
+            if (g_network && !InRoom(NameOf(hslot))) {        // someone without the mod (she isn't in
+                g_brain.cause = BUMP;                         // their game): a plain bump, no stare, no
+                g_brain.wall = true;                          // ball back (user: ignore them)
+            }
             Log("pushed: %.2f m/s off what she set (velocity %.2f %.2f %.2f), nearest head %.2f m: %s", Len(off),
                 v[0], v[1], v[2], hd, CauseName(g_brain.cause));
             Event("event %s by=%s", g_brain.cause == HEADBUTT ? "headbutt" : "bumped", NameOf(hslot));
@@ -1248,7 +1310,12 @@ void Tick() {
             g_orders.order = O_STAY;
             Event("event arrived");
         }
-        if (player) {
+        float lp[3], lv[3];
+        int ls = now < g_look_until ? SlotOf(g_look) : -1;
+        if (ls >= 0 && PlayerAt(ls, lp, lv)) {                // someone is talking to her: face them
+            float look[3] = { lp[0] - me.p[0], lp[1] - me.p[1], lp[2] - me.p[2] };
+            FaceTowards(me, look, w);
+        } else if (player) {
             float look[3] = { pl[0] - me.p[0], pl[1] - me.p[1], pl[2] - me.p[2] };
             FaceTowards(me, look, w);
         }
@@ -1627,6 +1694,49 @@ int OwnSlot() {
     return own;
 }
 
+// Which slot is YOU: the one occupied slot whose player has no remote body (EchoXR-Hands' rule; the
+// R14RemotePlayer system holds every other player's body). The old "head at your ears" guess flipped
+// between nearby players in a busy lobby (user, 2026-10-18: her brain saw PIBBLE, Hi, Ivan... as you),
+// which broke her room on the relay and who she answered. POD only: it runs under __try.
+constexpr uint64_t SYM_REMOTE_PLAYER = 0x999d680b6b01b67eull;   // R14RemotePlayer
+int IsRemote(uint8_t *cs, uint64_t actor) {
+    using lookup_fn = uint32_t *(__fastcall *)(void *, uint64_t *, uint64_t, int64_t);
+    using valid_fn = int(__fastcall *)(void *, uint32_t);
+    void **vt = *(void ***)cs;
+    uint64_t tmp = 0;
+    uint32_t *hp = ((lookup_fn)vt[0x1a8 / 8])(cs, &tmp, actor, -1);
+    if (!hp || (*hp & 0xffff) == 0xffff) return 0;
+    return ((valid_fn)vt[0x1c8 / 8])(cs, *hp) ? 1 : 0;
+}
+int LocalSlotByBody(uint8_t *ng, const SlotName *names, int n) {
+    __try {
+        uint8_t *cs[8];
+        int ncs = 0;
+        for (auto &x : g_seen) {
+            if (!x.space || *(void **)(x.transforms + 0x80) != x.space || ncs >= 8) continue;
+            uint8_t *c = FindSystem(x.space, SYM_REMOTE_PLAYER);
+            bool dup = false;
+            for (int i = 0; i < ncs; ++i) dup |= cs[i] == c;
+            if (c && !dup) cs[ncs++] = c;
+        }
+        if (!ncs) return -1;
+        int local = -1, nolocal = 0;
+        for (int i = 0; i < n; ++i) {
+            int s = names[i].slot;
+            const uint64_t *raw = (const uint64_t *)(ng + (size_t)s * 0x250 + 0x180);
+            uint64_t cand[3] = { raw[0], raw[1], 0 };
+            uint64_t out[2] = { raw[0], raw[1] };
+            if (SlotActor) { SlotActor(ng, (uint8_t *)out, (uint32_t)s); cand[2] = out[0]; }
+            bool remote = false;
+            for (int c = 0; c < 3 && !remote; ++c)
+                if (cand[c] && cand[c] != ~0ull)
+                    for (int k = 0; k < ncs && !remote; ++k) remote = IsRemote(cs[k], cand[c]) == 1;
+            if (!remote) { local = s; ++nolocal; }
+        }
+        return nolocal == 1 ? local : -2;                     // -2: not sure (keep what we had)
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
 void UpdateNet(uint8_t *ng) {
     static ULONGLONG last = 0;
     ULONGLONG now = GetTickCount64();
@@ -1637,8 +1747,16 @@ void UpdateNet(uint8_t *ng) {
     if (n < 0) return;
     memcpy(g_names, names, sizeof names);                     // (who is who: orders and events by name)
     g_nnames = n;
-    int own = OwnSlot();
-    if (own >= 0) g_own_slot = own;
+    const char *how = "the one player without a remote body";
+    int body = LocalSlotByBody(ng, names, n);
+    bool known = false;
+    for (int i = 0; i < n; ++i) known |= names[i].slot == g_own_slot;
+    if (body >= 0) g_own_slot = body;
+    else if (!known) {                                        // not sure yet and nothing to keep: the old guess
+        int own = OwnSlot();
+        if (own >= 0) g_own_slot = own;
+        how = "the head at your ears";
+    }
     std::string me = g_my_name;
     if (me.empty())
         for (int i = 0; i < n; ++i)
@@ -1648,7 +1766,7 @@ void UpdateNet(uint8_t *ng) {
         if (said_me != "?") { said_me = "?"; Log("edith net: waiting to know which player is you (%d in the match)", n); }
         return;
     }
-    if (me != said_me) { said_me = me; Log("edith net: you are '%s' (%s)", me.c_str(), g_my_name[0] ? "EDITH.ini my_name" : "the head at your ears"); }
+    if (me != said_me) { said_me = me; Log("edith net: you are '%s' (%s)", me.c_str(), g_my_name[0] ? "EDITH.ini my_name" : how); }
     strncpy_s(g_me, me.c_str(), _TRUNCATE);
     if (!g_network) return;
     std::vector<std::string> others;
@@ -1798,6 +1916,88 @@ bool SendCtl(const char *to, const char *what, float speed, const float *from) {
     return true;
 }
 
+// Her voice for everyone: the host's companion plays a line from the voice pack and says which files
+// ("voice <key> [<key>...]"); the host sends the keys to the room, and each puppet plays the same files
+// from its own <plugins>\EdithVoice through her speaker (UDP 47323, paced like the companion streams),
+// so players without the companion hear her too. Lines not in the pack (streamed) stay host-only.
+bool VoiceKeysOk(const char *k) {
+    for (; *k; ++k)
+        if (!((*k >= '0' && *k <= '9') || (*k >= 'a' && *k <= 'f') || *k == ' ')) return false;
+    return true;
+}
+void SendVoice(const char *keys) {
+    if (strcmp(g_net_role, "host") || !VoiceKeysOk(keys) || strlen(keys) > 400) return;
+    EdithNet_SendText(std::string("{\"t\":\"voice\",\"keys\":\"") + keys + "\"}");
+}
+void SendSnow(unsigned k, const float *at, const float *v) {
+    if (strcmp(g_net_role, "host")) return;
+    char b[192];
+    snprintf(b, sizeof b, "{\"t\":\"snow\",\"k\":%u,\"pos\":[%.3f,%.3f,%.3f],\"vel\":[%.3f,%.3f,%.3f]}",
+             k, at[0], at[1], at[2], v[0], v[1], v[2]);
+    EdithNet_SendText(b);
+}
+void SendFace(const char *name, float seconds) {             // her face, for puppets without a companion
+    if (strcmp(g_net_role, "host")) return;
+    char b[128];
+    snprintf(b, sizeof b, "{\"t\":\"face\",\"name\":\"%s\",\"s\":%.1f}", JEsc(name).c_str(), seconds);
+    EdithNet_SendText(b);
+}
+std::mutex g_voice_mx;
+std::condition_variable g_voice_cv;
+std::deque<std::string> g_voice_q;
+void VoiceWorker() {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in to = {};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(47323);                                // her speaker (VOICE_PORT)
+    inet_pton(AF_INET, "127.0.0.1", &to.sin_addr);
+    constexpr size_t CHUNK = 24000 / 10 * 2;                   // 0.1 s of int16 mono 24 kHz
+    for (;;) {
+        std::string keys;
+        {
+            std::unique_lock<std::mutex> lk(g_voice_mx);
+            g_voice_cv.wait(lk, [] { return !g_voice_q.empty(); });
+            keys = g_voice_q.front();
+            g_voice_q.pop_front();
+        }
+        std::vector<char> pcm;
+        for (size_t p = 0; p < keys.size();) {
+            size_t e = keys.find(' ', p);
+            std::string k = keys.substr(p, e == std::string::npos ? std::string::npos : e - p);
+            p = e == std::string::npos ? keys.size() : e + 1;
+            if (k.size() != 20) continue;
+            std::string path = std::string(g_voice_dir) + k + ".pcm";
+            FILE *f = nullptr;
+            if (fopen_s(&f, path.c_str(), "rb") || !f) { Log("voice: %s not in the pack", k.c_str()); continue; }
+            char buf[65536];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0) pcm.insert(pcm.end(), buf, buf + n);
+            fclose(f);
+        }
+        ULONGLONG t0 = GetTickCount64();
+        double sent = 0;
+        for (size_t i = 0; i + 1 < pcm.size(); i += CHUNK) {
+            int n = (int)min(CHUNK, (pcm.size() - i) & ~(size_t)1);
+            sendto(s, pcm.data() + i, n, 0, (sockaddr *)&to, sizeof to);
+            sent += n / 2 / 24000.0;
+            double ahead = sent - (GetTickCount64() - t0) / 1000.0;
+            if (ahead > 0.4) Sleep((DWORD)((ahead - 0.4) * 1000));
+        }
+        double left = sent - (GetTickCount64() - t0) / 1000.0;
+        if (left > 0) Sleep((DWORD)(left * 1000) + 400);       // her tail, then the next line
+    }
+}
+void PlayPack(const std::string &keys) {
+    if (!g_voice_dir[0] || !VoiceKeysOk(keys.c_str())) return;
+    static bool started = false;
+    {
+        std::lock_guard<std::mutex> lk(g_voice_mx);
+        if (g_voice_q.size() < 6) g_voice_q.push_back(keys);
+        if (!started) { started = true; std::thread(VoiceWorker).detach(); }
+    }
+    g_voice_cv.notify_one();
+}
+
 void SendTouch(const char *what, const float *v, const char *kind) {
     char b[192];
     int n = snprintf(b, sizeof b, "{\"t\":\"touch\",\"what\":\"%s\"", what);
@@ -1894,6 +2094,13 @@ void TakeNet() {
             if (g_touches.size() < 32) g_touches.push_back(tc);
         } else if (t == "ctl" && JStr(m.data, "to") == g_me) {
             DoCtl(JStr(m.data, "do"), JNum(m.data, "speed", 0));
+        } else if (t == "voice" && !host && from == g_net_host) { // the host's Edith said a pack line
+            PlayPack(JStr(m.data, "keys"));
+        } else if (t == "snow" && !host && from == g_net_host) {  // ...threw a ball
+            float at[3], v[3];
+            if (JVec(m.data, "pos", at) && JVec(m.data, "vel", v)) LaunchSnow((unsigned)JNum(m.data, "k", 0), at, v);
+        } else if (t == "face" && !host && from == g_net_host) {  // ...changed face
+            SetFace(JStr(m.data, "name").c_str(), JNum(m.data, "s", 0));
         } else {
             static int logged = 0;
             if (logged++ < 20) Log("edith net: got %.80s", m.data.c_str());
@@ -2186,7 +2393,7 @@ void __fastcall Hooked_NetGameUpdate(uint8_t *ng) {
             g_brain.have = false;
         }
         if (g_authority || g_local) {                         // steering: where her physics is decided
-            if (puppet) PuppetTick();
+            if (puppet) { PuppetTick(); UpdateSnow(); }       // (thrown balls the host relayed)
             else if (host && g_holder[0] && HolderActive(now) && g_hold_rx.from == g_holder) {
                 Pose me;                                      // someone else's hand moves her: follow it
                 Real_TransformGet(g_her.transforms, &me, g_her.xf);
@@ -2426,23 +2633,26 @@ voice_read_fn VoiceRead = nullptr;
 AkGameObjFromPlaying_t AkGameObjFromPlaying = nullptr;
 AkQueryPosition_t AkQueryPosition = nullptr;
 bool g_hear_voip = true;
-struct VoipStream { void *obj; uint32_t id, rate; char name[64]; volatile ULONGLONG last; };
-VoipStream g_voip[16];
+// Keyed by the whole delegate {object, context}: Echo can register every remote voice with the same
+// object (11 voices at a lobby join, all landed on one entry, so one playing id's position named
+// everyone's voice: gg95 heard as you, Furo almost never; user, 2026-10-18).
+struct VoipStream { void *obj, *ctx; uint32_t id, rate; char name[64]; volatile ULONGLONG last; volatile bool member; };
+VoipStream g_voip[32];
 SOCKET g_voip_sock = INVALID_SOCKET;
 sockaddr_in g_voip_to = {};
 
-VoipStream *VoipFind(void *obj) {
+VoipStream *VoipFind(const SpeakerDelegate *d) {
     for (auto &s : g_voip)
-        if (s.obj == obj) return &s;
+        if (s.obj == d->a && s.ctx == d->b) return &s;
     return nullptr;
 }
 
 // Wwise's audio thread: the voice as Echo would play it, and a copy for her.
 int64_t VoipTap(SpeakerDelegate *d, int16_t *pcm, uint16_t n) {
     int64_t r = VoiceRead(d, pcm, n);
-    if (r <= 0 || g_voip_sock == INVALID_SOCKET) return r;
-    VoipStream *s = VoipFind(d->a);
-    if (!s) return r;
+    if (r <= 0 || (g_voip_sock == INVALID_SOCKET && !g_ears_dll)) return r;
+    VoipStream *s = VoipFind(d);
+    if (!s || !s->member) return r;                           // only players with the mod (user)
     s->last = GetTickCount64();
     char pkt[64 + 2 * 4096];
     char name[64];
@@ -2454,22 +2664,24 @@ int64_t VoipTap(SpeakerDelegate *d, int16_t *pcm, uint16_t n) {
     pkt[8] = (char)len;
     memcpy(pkt + 9, name, len);
     memcpy(pkt + 9 + len, pcm, frames * 2);
-    sendto(g_voip_sock, pkt, (int)(9 + len + frames * 2), 0, (sockaddr *)&g_voip_to, sizeof g_voip_to);
+    if (g_ears_dll) Ears_Voip(name, s->rate, pcm, frames);   // her built-in ears
+    else sendto(g_voip_sock, pkt, (int)(9 + len + frames * 2), 0, (sockaddr *)&g_voip_to, sizeof g_voip_to);
     return r;
 }
 
 uint64_t __fastcall Hooked_Register(void *reg, uint32_t id, const SpeakerDelegate *d, const SpeakerFormat *f) {
     if (g_hear_voip && d && f && (void *)d->fn == (void *)VoiceRead) {
-        VoipStream *s = VoipFind(d->a);
+        VoipStream *s = VoipFind(d);
         if (!s) {                                                  // a free (or the quietest) entry
             s = &g_voip[0];
             for (auto &x : g_voip)
                 if (!x.obj || x.last < s->last) s = &x;
         }
-        s->obj = d->a; s->id = id; s->rate = f->rate; s->name[0] = 0; s->last = GetTickCount64();
+        s->obj = d->a; s->ctx = d->b; s->id = id; s->rate = f->rate; s->name[0] = 0; s->member = false;
+        s->last = GetTickCount64();
         SpeakerDelegate w = *d;
         w.fn = VoipTap;
-        Log("voip: a voice (playing id %u, %u Hz): listening", id, f->rate);
+        Log("voip: a voice (playing id %u, %u Hz, delegate %p/%p): listening", id, f->rate, d->a, d->b);
         return Real_Register(reg, id, &w, f);
     }
     return Real_Register(reg, id, d, f);
@@ -2495,6 +2707,7 @@ void UpdateVoip(ULONGLONG now) {
             if (Len(d) < bd) { bd = Len(d); best = i; }
         }
         const char *name = best >= 0 ? g_names[best].name : "";
+        s.member = name[0] && InRoom(name);                    // (the audio thread forwards members only)
         if (strcmp(name, s.name)) {
             Log("voip: playing id %u is %s (voice at %.2f %.2f %.2f)", s.id, name[0] ? name : "nobody we know", p[0], p[1], p[2]);
             strncpy_s(s.name, name, _TRUNCATE);
@@ -2522,6 +2735,68 @@ bool VoipInstall(uint8_t *base) {
     Real_Register = (register_fn)(base + REGISTRY_REGISTER_RVA);
     Log("voip: voice chat to 127.0.0.1:%u (her ears)", VOIP_PORT);
     return true;
+}
+
+// ---- her built-in ears (edith_ears.cpp): what they ask of the DLL ----------------------------------
+char g_brain_url[256] = "wss://sparkapi-production-e6df.up.railway.app/edith/brain";
+char g_mic[32] = "default";
+bool EarsInLobby() { return g_her_pos_ok != 0; }
+bool EarsMuted() { return g_muted == 1; }
+bool EarsPuppet() { return !strcmp(g_net_role, "puppet"); }
+bool EarsHasEars(const char *name) {                          // in the room's ai list (their own game hears them)
+    size_t n = strlen(name);
+    for (const char *p = g_net_ai; *p;) {
+        const char *e = strchr(p, ',');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == n && !strncmp(p, name, n)) return true;
+        if (!e) break;
+        p = e + 1;
+    }
+    return false;
+}
+const char *EarsMe() { return g_me; }
+// A reply's order, as the Python companion sent it: "heard <text>" (a puppet's own speech) goes to the
+// host through the relay at once (a puppet doesn't poll its order port); a push / shutdown aimed at you
+// goes to your own client's body port (:47325, without to=); "voice" is the pack line for the others;
+// everything else to the order port (:47321).
+void EarsOrder(const char *order) {
+    if (!strncmp(order, "heard ", 6)) { ForwardHeard(order + 6); return; }
+    if (!strncmp(order, "voice ", 6)) { SendVoice(order + 6); return; }
+    static SOCKET sk = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    std::string o = order, to;
+    size_t t = o.find(" to=");
+    if (t != std::string::npos) { to = o.substr(t + 4); to = to.substr(0, to.find(' ')); }
+    bool body = (!strncmp(order, "push", 4) || !strncmp(order, "shutdown", 8)) && (to.empty() || to == g_me || to == "you");
+    if (body && t != std::string::npos) o = o.substr(0, t) + o.substr(o.find(' ', t + 1) == std::string::npos ? o.size() : o.find(' ', t + 1));
+    sockaddr_in a = {};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(body ? SELF_PORT : CMD_PORT);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    sendto(sk, o.c_str(), (int)o.size(), 0, (sockaddr *)&a, sizeof a);
+}
+void EarsVoiceKeys(const char *keys) { SendVoice(keys); }
+bool EarsSpeakerPush(const int16_t *pcm, size_t n) {
+    LONG64 wr = g_wr;
+    if (!g_spk.playing || (size_t)(wr - g_rd) + n > RING - VOICE_RATE / 10) return false;   // (no room / no speaker)
+    for (size_t k = 0; k < n; ++k) g_ring[(wr + k) & (RING - 1)] = pcm[k];
+    g_wr = wr + (LONG64)n;
+    return true;
+}
+size_t EarsSpeakerPending() { LONG64 d = g_wr - g_rd; return d > 0 ? (size_t)d : 0; }
+
+void StartEars() {
+    EarsHost h = {};
+    h.log = Log;
+    h.in_lobby = EarsInLobby;
+    h.muted = EarsMuted;
+    h.puppet = EarsPuppet;
+    h.has_ears = EarsHasEars;
+    h.me = EarsMe;
+    h.order = EarsOrder;
+    h.voice_keys = EarsVoiceKeys;
+    h.speaker_push = EarsSpeakerPush;
+    h.speaker_pending = EarsSpeakerPending;
+    Ears_Start(h, g_brain_url, g_voice_dir, g_mic);
 }
 
 // Her AI (EDITH.ini ai=<path to run_edith_ears.ps1>): started without a window when the game
@@ -2627,6 +2902,7 @@ DWORD WINAPI Install(LPVOID) {
         g_ai.sin_port = htons(EVENT_PORT);
         inet_pton(AF_INET, "127.0.0.1", &g_ai.sin_addr);
     }
+    if (g_ears_dll) StartEars();
     Log("hooked CTransformCS::get + CR15NetGame::Update: %ld (%s)", rc, g_authority ? "authority: she is steered here" : g_local ? "local mode: steered on this client, following you" : "not authority: idle");
     return 0;
 }
@@ -2651,6 +2927,8 @@ BOOL WINAPI DllMain(HMODULE self, DWORD reason, LPVOID) {
         EdithPack_Install(self, Log);                         // her lobby data from <plugins>\<dll name>\*.edith (no repack)
         char ini[MAX_PATH], buf[64];
         GetModuleFileNameA(self, ini, MAX_PATH);
+        strcpy_s(g_voice_dir, ini);                           // <plugins>\EdithVoice\ next to the DLL
+        if (char *sl = strrchr(g_voice_dir, '\\')) strcpy_s(sl + 1, g_voice_dir + MAX_PATH - (sl + 1), "EdithVoice\\");
         if (char *dot = strrchr(ini, '.')) strcpy_s(dot, ini + MAX_PATH - dot, ".ini");
         unsigned index = GetPrivateProfileIntA("satellite", "index", 659, ini);
         HER_ACTOR = 0x0000FFFFFFFF0000ull | (index & 0xffff);
@@ -2673,7 +2951,13 @@ BOOL WINAPI DllMain(HMODULE self, DWORD reason, LPVOID) {
         if (GetPrivateProfileStringA("satellite", "voice_full", "", buf, sizeof buf, ini)) g_voice_full = (float)atof(buf);
         if (GetPrivateProfileStringA("satellite", "voice_cutoff", "", buf, sizeof buf, ini)) g_voice_cutoff = (float)atof(buf);
         GetPrivateProfileStringA("satellite", "ai", "", g_ai_script, sizeof g_ai_script, ini);
-        g_ai_configured = g_ai_script[0] && GetFileAttributesA(g_ai_script) != INVALID_FILE_ATTRIBUTES;
+        char ears[16];                                        // her ears: built in (dll), the Python companion
+        GetPrivateProfileStringA("satellite", "ears", "dll", ears, sizeof ears, ini);   // (python, ai=), or off
+        GetPrivateProfileStringA("satellite", "brain", g_brain_url, g_brain_url, sizeof g_brain_url, ini);
+        GetPrivateProfileStringA("satellite", "mic", g_mic, g_mic, sizeof g_mic, ini);
+        g_ears_dll = !_stricmp(ears, "dll") && !g_server;     // (a dedicated server has no player to hear)
+        if (_stricmp(ears, "python")) g_ai_script[0] = 0;     // built in or off: no Python companion
+        g_ai_configured = g_ears_dll || (g_ai_script[0] && GetFileAttributesA(g_ai_script) != INVALID_FILE_ATTRIBUTES);
         if (g_ai_script[0] && GetFileAttributesA(g_ai_script) != INVALID_FILE_ATTRIBUTES)
             CreateThread(nullptr, 0, LaunchAI, nullptr, 0, nullptr);
         else if (g_ai_script[0]) Log("ai: %s not found", g_ai_script);

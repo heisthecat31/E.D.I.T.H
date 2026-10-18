@@ -2,6 +2,8 @@
 rem E.D.I.T.H installer: finds Echo VR (Spark's settings, else asks), refuses nEVR, installs the
 rem plugin loader if there isn't one, then EDITH.dll, EDITH.ini, her map package and her voice.
 setlocal EnableExtensions EnableDelayedExpansion
+rem Windows' own tools by full path: a PATH with Git's Unix tools first made "find /i" crawl the I: drive
+set "SYS=%SystemRoot%\System32"
 title E.D.I.T.H installer
 set "HERE=%~dp0"
 set "FILES=%HERE%files"
@@ -20,7 +22,7 @@ set "GAME="
 set "SPARK=%APPDATA%\IgniteVR\Spark\settings.json"
 set "SPARKPATH="
 if exist "%SPARK%" (
-    for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "try { (Get-Content -Raw -LiteralPath $env:SPARK | ConvertFrom-Json).echoVRPath } catch { }"`) do set "SPARKPATH=%%P"
+    for /f "usebackq delims=" %%P in (`%SYS%\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { (Get-Content -Raw -LiteralPath $env:SPARK | ConvertFrom-Json).echoVRPath } catch { }"`) do set "SPARKPATH=%%P"
 )
 if defined SPARKPATH (
     call :resolve "!SPARKPATH!"
@@ -28,7 +30,7 @@ if defined SPARKPATH (
         echo   Spark says Echo VR is here:
         echo     !FOUND!
         echo.
-        choice /c YN /m "  Is this the right Echo VR"
+        "%SYS%\choice.exe" /c YN /m "  Is this the right Echo VR"
         if !errorlevel! equ 1 set "GAME=!FOUND!"
         echo.
     )
@@ -54,11 +56,11 @@ echo   Echo VR found at: %GAME%
 echo.
 
 rem ---- 2. Echo must be closed ------------------------------------------------------------------
-tasklist /fi "imagename eq echovr.exe" 2>nul | find /i "echovr.exe" >nul
+"%SYS%\tasklist.exe" /fi "imagename eq echovr.exe" /nh 2>nul | "%SYS%\findstr.exe" /i /c:"echovr.exe" >nul
 if not errorlevel 1 (
     echo   Echo VR is running. Close it, then press a key.
     pause >nul
-    tasklist /fi "imagename eq echovr.exe" 2>nul | find /i "echovr.exe" >nul
+    "%SYS%\tasklist.exe" /fi "imagename eq echovr.exe" /nh 2>nul | "%SYS%\findstr.exe" /i /c:"echovr.exe" >nul
     if not errorlevel 1 ( echo   Echo VR is still running. & goto :fail )
 )
 
@@ -67,7 +69,7 @@ if exist "%GAME%\BugSplat64.dll" (
     for %%F in ("%GAME%\BugSplat64.dll") do set "BSIZE=%%~zF"
     if !BSIZE! gtr 665600 (
         set "BHASH="
-        for /f "skip=1 delims=" %%H in ('certutil -hashfile "%GAME%\BugSplat64.dll" SHA256 2^>nul') do if not defined BHASH set "BHASH=%%H"
+        for /f "skip=1 delims=" %%H in ('%SYS%\certutil.exe -hashfile "%GAME%\BugSplat64.dll" SHA256 2^>nul') do if not defined BHASH set "BHASH=%%H"
         set "BHASH=!BHASH: =!"
         if /i not "!BHASH!"=="%STOCK_BUGSPLAT_SHA256%" (
             echo   nEVR is installed in this Echo VR ^(its BugSplat64.dll is !BSIZE! bytes, the original is 630,288^).
@@ -102,10 +104,10 @@ if exist "%P%\EDITH.ini" (
     copy /y "%FILES%\plugins\EDITH.ini" "%P%\EDITH.ini" >nul || goto :copyfail
 )
 if exist "%P%\EDITH\cache" rd /s /q "%P%\EDITH\cache"
-robocopy "%FILES%\plugins\EDITH" "%P%\EDITH" /e /njh /njs /ndl /nfl /nc /ns /np >nul
+"%SYS%\robocopy.exe" "%FILES%\plugins\EDITH" "%P%\EDITH" /e /njh /njs /ndl /nfl /nc /ns /np >nul
 if errorlevel 8 goto :copyfail
 echo   Copying her voice ^(about 200 MB^)...
-robocopy "%FILES%\plugins\EdithVoice" "%P%\EdithVoice" /e /njh /njs /ndl /nfl /nc /ns /np >nul
+"%SYS%\robocopy.exe" "%FILES%\plugins\EdithVoice" "%P%\EdithVoice" /e /njh /njs /ndl /nfl /nc /ns /np >nul
 if errorlevel 8 goto :copyfail
 echo.
 echo   Done. E.D.I.T.H is installed: start Echo VR and go to the lobby.

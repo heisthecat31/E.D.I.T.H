@@ -333,6 +333,9 @@ class Voice:
                 if out == "none":                              # (tests: fetch it, play nothing)
                     log(f"voice: {sum(len(p) for p in self._pcm(items)) / 2 / RATE:.2f} s, not played")
                 elif out == "game" or (out == "auto" and self.game.speaker_on()):
+                    keys = [p.stem for p in items if isinstance(p, Path)]
+                    if keys:                                   # the other players' EDITH.dll play the same
+                        send_order("voice " + " ".join(keys))  # pack files (only the host's DLL sends them on)
                     self._game(items)
                 else:
                     self._local(items)

@@ -44,6 +44,31 @@ Her rules and voice rules are unchanged: no emoji, never the word "coming", neve
   Whisper runs in a thread (one at a time); the rules run on the event loop.
 - **Old companion:** `ai/satellite_ai.py` still works fully offline (`run_satellite_ai.ps1`).
 
+## Built-in ears (EDITH.dll, 2026-10-18)
+
+Players without the Python companion only had her voice and ears while someone with it hosted;
+alone, nothing in their game talked to the brain (user: "why does he only hear her when I'm in
+lobby"). `plugin/edith_ears.cpp` does what `ai/edith_ears.py` did, inside the DLL:
+
+- **Brain link:** a WinHTTP WebSocket to `brain=` (default Railway), the same messages (`hello`
+  with build `ears-dll-1`, `dll` lines, `EDA1` utterances, `speaking`, `render` / `EDV1`).
+- **Up:** every `Event()` line; the mic (WASAPI shared, default recording device, `mic=default |
+  communications | off`) mixed to mono 16 kHz, speech found by level like the companion. Nothing is
+  sent while muted on voice chat, while her line plays, outside her lobby, or with no link. Voice chat
+  from the tap goes straight in (host only, members without their own ears).
+- **Down:** faces and orders: `heard <text>` goes to the host through the relay at once (a puppet
+  never polled its order port, so the old companion's forwarding never arrived); a push / shutdown at
+  you goes to :47325; `voice` keys to the room; the rest to :47321. Her line: pack file (with the
+  broken-render check) or streamed render, written straight into her speaker's ring.
+- **`EDITH.ini ears=`:** `dll` (default), `python` (the old companion through `ai=`), `off`. A
+  `-server` never starts them.
+- Also fixed the same day: voice chat streams are keyed by the whole delegate {object, context}.
+  Echo registered 11 voices on one object at a lobby join, so one playing id's position named
+  everyone's voice (gg95 heard as you, Furo almost never).
+- **Tested 15:05 offline in VR:** mic open (48 kHz mono float), brain connected; "Edith, hello",
+  "follow", "spin" answered from the pack with the orders applied, Whisper about 0.3 s. Not yet:
+  two players both with built-in ears, a puppet's speech forwarded to the host.
+
 ## Who and what is remembered
 
 - **Records per player name** (`edith_players`, JSONB, when `DATABASE_URL` is set; else

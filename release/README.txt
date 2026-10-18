@@ -16,6 +16,12 @@ What it installs (into <Echo VR>\bin\win10\plugins)
   EdithVoice\          her voice lines
   If the game has no plugins folder yet, it also installs the plugin loader (dbgcore.dll).
 
+Talking to her
+  She listens through your microphone (your default recording device). While you're in her lobby
+  and not muted on Echo's voice chat, what you say is sent to her server, where it's turned into
+  text so she can answer; nothing is sent while you're muted or away from her lobby. To turn her
+  ears off, put "mic=off" under [satellite] in EDITH.ini. Say "Edith" to get her attention.
+
 Not compatible with nEVR: the installer checks for it and stops without changing anything.
 
 Uninstall
