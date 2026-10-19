@@ -1,18 +1,23 @@
 """Her voice lines as Wwise banks, one per line, packed into out/edith_voice.bin for EDITH.dll.
 
-    python -I tools/make_voice_banks.py [--voice <EdithVoice dir>] [--out out/edith_voice.bin] [--only KEY ...]
+    python -I tools/make_voice_banks.py [--voice out/EdithVoice] [--out out/edith_voice.bin] [--only KEY ...]
+    python -I tools/make_voice_banks.py --template-from <extracted game data root>   (once; see below)
 
-Each line (<key>.pcm, int16 mono 24 kHz, tools/make_voice_pack.py) becomes a bank the game's
-sound engine loads from EDITH.dll's memory (AK::SoundEngine::LoadBank, in memory):
+Each line (<key>.pcm, int16 mono 24 kHz, from tools/make_voice_pack.py) becomes a bank the game's sound
+engine loads from EDITH.dll's memory (AK::SoundEngine::LoadBank, in memory):
 
     event  FNV("play_edith_<key>") -> Play action -> sound -> media (embedded, Wwise IMA ADPCM)
 
-The sound is built like the game's own 3D sounds (EchoCombat tools/veil_sound.py): the veil
-sound's body, given the arc mine's attenuation (copied into each bank: a bank carries what its
-sounds use) and positioned in 3D, with no parent, routed to bus 870370818: the bus voice chat
-mixes to (event 0xf5b8b08d -> switch 991794051 -> actor-mixer 69364446 -> bus 870370818, from the
-always-loaded Init bank), so her lines sit where her streamed voice did. The plugin posts the event
-on her speaker's game object, which follows her.
+The sound is built like the game's own 3D sounds (EchoCombat tools/veil_sound.py): the veil sound's
+body, given the arc mine's attenuation (copied into each bank: a bank carries what its sounds use) and
+positioned in 3D, with no parent, routed to bus 870370818: the bus voice chat mixes to (event
+0xf5b8b08d -> switch 991794051 -> actor-mixer 69364446 -> bus 870370818, from the always-loaded Init
+bank), so her lines sit where her streamed voice did. The plugin posts the event on her speaker's
+game object, which follows her.
+
+Those three pieces of the game's banks (the bank header, the sound body, the attenuation) are kept in
+tools/voice_bank_template.json, so building needs no game files. --template-from rewrites it from an
+extracted game (the folder holding 6d358eef7bb85a98\\<bank> files, e.g. H:\\pcvr-extracted).
 
 out/edith_voice.bin ("EDVB"): u32 magic, u32 count, then per line (sorted by key) 20 ascii hex key
 chars, u32 event id, u32 bank id, u32 offset, u32 size, u32 milliseconds; then the banks, each
@@ -22,27 +27,90 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import struct
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
-sys.path.insert(0, r"J:\EchoVR-Tools-Launcher\EchoCombat\tools")
-from veil_sound import (ATT_SRC_BANK, ATTENUATION, BANK, BANK_TYPE, SOUND, chunks,  # noqa: E402
-                        hirc_object, hirc_objects, positioned)
-
-STOCK = Path(r"H:\pcvr-extracted") / BANK_TYPE
-VOICE = Path(r"C:\Oculus\Games\Software\Software\ready-at-dawn-echo-arena\bin\win10\plugins\EdithVoice")
+TEMPLATE = HERE / "tools" / "voice_bank_template.json"
 RATE = 24000
 PLUGIN_ADPCM = 0x00020001
 VOICE_BUS = 870370818
 SOUND_BUS, SOUND_PARENT = 17, 21          # OverrideBusId, DirectParentID in a sound's body
+SOUND_PROPS = 26                          # its props count; the ranged-props count and positioning follow
+#: the game's banks the template comes from (CWWiseSoundBankResourceWin10 resources)
+BANK_TYPE = "6d358eef7bb85a98"
+VEIL_BANK, VEIL_SOUND = "3f1464db1fe49b5", 1028260926          # (the extract drops the leading 0)
+ATT_BANK, ATTENUATION = "c823e2c9bc0168ad", 686965829         # the arc mine's: silent by 40 m
 #: fmt chunk of a mono 24 kHz Wwise IMA ADPCM wem: tag 2, 1 channel, 24000 Hz, 13500 B/s,
 #: 36-byte blocks, 4 bits, 6 extra bytes: 64 samples per block, channel config 0x4101 (mono, FC)
 #: as the game's own PCM wems write it.
 FMT = (b"fmt " + struct.pack("<IHHIIHHH", 0x18, 2, 1, RATE, RATE * 36 // 64, 36, 4, 6)
        + struct.pack("<HI", 64, 0x4101))
 
+
+# ---- Wwise bank pieces (as EchoCombat tools/veil_sound.py) ----------------------------------------------
+
+def chunks(bank: bytes) -> list:
+    """[(tag, payload)] of a Wwise bank (starting at BKHD)."""
+    out, o = [], 0
+    while o + 8 <= len(bank):
+        tag, size = bank[o:o + 4], struct.unpack_from("<I", bank, o + 4)[0]
+        out.append((tag, bytes(bank[o + 8:o + 8 + size])))
+        o += 8 + size
+    if o != len(bank):
+        raise ValueError("bank does not parse into chunks")
+    return out
+
+
+def hirc_object(kind: int, oid: int, body: bytes) -> bytes:
+    return struct.pack("<BII", kind, 4 + len(body), oid) + body
+
+
+def hirc_objects(asset: bytes) -> dict:
+    """object id -> (kind, body), for every HIRC object of a bank resource (16-byte header, 8-byte tail)."""
+    h = dict(chunks(asset[16:-8]))[b"HIRC"]
+    p, out = 4, {}
+    for _ in range(struct.unpack_from("<I", h, 0)[0]):
+        kind, size, oid = struct.unpack_from("<BII", h, p)
+        out[oid] = (kind, bytes(h[p + 9:p + 5 + size]))
+        p += 5 + size
+    return out
+
+
+def positioned(body: bytes, attenuation: int) -> bytes:
+    """A sound body (no props or positioning of its own) given 3D positioning and an attenuation:
+    props {AttenuationID (0x46)}, no ranged props, posbits 3, bits3d 10, as the game's 3D sounds."""
+    if body[15] or body[SOUND_PROPS:SOUND_PROPS + 3] != bytes(3):
+        raise ValueError("sound object already has props or positioning")
+    return (body[:SOUND_PROPS] + struct.pack("<BBIB", 1, 0x46, attenuation, 0) + bytes([3, 10])
+            + body[SOUND_PROPS + 3:])
+
+
+def template_from(root: Path):
+    """The three pieces from an extracted game -> tools/voice_bank_template.json."""
+    veil = (root / BANK_TYPE / VEIL_BANK).read_bytes()
+    kind, att = hirc_objects((root / BANK_TYPE / ATT_BANK).read_bytes())[ATTENUATION]
+    if kind != 14:
+        raise ValueError(f"{ATT_BANK}: object {ATTENUATION} is not an attenuation")
+    body = bytearray(positioned(hirc_objects(veil)[VEIL_SOUND][1], ATTENUATION))
+    struct.pack_into("<II", body, SOUND_BUS, VOICE_BUS, 0)
+    t = {"bkhd": dict(chunks(veil[16:-8]))[b"BKHD"].hex(), "sound": bytes(body).hex(), "attenuation": att.hex(),
+         "from": f"{BANK_TYPE}/{VEIL_BANK} sound {VEIL_SOUND}, {BANK_TYPE}/{ATT_BANK} attenuation {ATTENUATION}"}
+    TEMPLATE.write_text(json.dumps(t, indent=1) + "\n", encoding="utf-8")
+    print(f"{TEMPLATE}: written from {root}")
+
+
+def templates():
+    """(BKHD payload, the 3D voice sound body, the attenuation body)."""
+    if not TEMPLATE.exists():
+        sys.exit(f"{TEMPLATE} missing: run with --template-from <extracted game data root>")
+    t = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+    return bytes.fromhex(t["bkhd"]), bytes.fromhex(t["sound"]), bytes.fromhex(t["attenuation"])
+
+
+# ---- her lines -> banks ---------------------------------------------------------------------------
 
 def fnv(name: str) -> int:
     """Wwise's id for a name: FNV-1 32-bit of the lowercase name."""
@@ -72,17 +140,6 @@ def adpcm_wem(lib, pcm: bytes) -> bytes:
     return b"RIFF" + struct.pack("<I", len(body)) + body
 
 
-def templates():
-    """(BKHD payload, the 3D voice sound body, the attenuation body) from the game's banks."""
-    veil = (STOCK / BANK).read_bytes()
-    bkhd = dict(chunks(veil[16:-8]))[b"BKHD"]
-    kind, att = hirc_objects((STOCK / ATT_SRC_BANK).read_bytes())[ATTENUATION]
-    assert kind == 14
-    body = bytearray(positioned(hirc_objects(veil)[SOUND][1], ATTENUATION))
-    struct.pack_into("<II", body, SOUND_BUS, VOICE_BUS, 0)
-    return bytes(bkhd), bytes(body), att
-
-
 def line_bank(key: str, wem: bytes, bkhd: bytes, sound: bytes, att: bytes):
     bank_id, media = fnv(f"edith_{key}"), fnv(f"edith_media_{key}")
     sound_id, action, event = fnv(f"edith_sound_{key}"), fnv(f"edith_action_{key}"), fnv(f"play_edith_{key}")
@@ -102,21 +159,26 @@ def line_bank(key: str, wem: bytes, bkhd: bytes, sound: bytes, att: bytes):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--voice", default=str(VOICE))
+    ap.add_argument("--voice", default=str(HERE / "out" / "EdithVoice"), help="her voice pack (make_voice_pack.py)")
     ap.add_argument("--out", default=str(HERE / "out" / "edith_voice.bin"))
     ap.add_argument("--only", nargs="*", help="just these keys (a test bank)")
+    ap.add_argument("--template-from", help="rewrite tools/voice_bank_template.json from an extracted game, then stop")
     a = ap.parse_args()
+    if a.template_from:
+        template_from(Path(a.template_from))
+        return 0
     lib = codec()
     bkhd, sound, att = templates()
     files = sorted(Path(a.voice).glob("*.pcm"))
     if a.only:
         files = [f for f in files if f.stem in a.only]
+    files = [f for f in files if len(f.stem) == 20]
+    if not files:
+        sys.exit(f"no voice lines in {a.voice}")
     rows, blobs, at = [], [], 0
     head = 8 + len(files) * 40
     head += -head % 16
     for f in files:
-        if len(f.stem) != 20:
-            continue
         pcm = f.read_bytes()
         event, bank_id, bank = line_bank(f.stem, adpcm_wem(lib, pcm), bkhd, sound, att)
         rows.append((f.stem.encode(), event, bank_id, head + at, len(bank), len(pcm) * 1000 // (2 * RATE)))
