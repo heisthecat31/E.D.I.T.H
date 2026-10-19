@@ -2,9 +2,10 @@
 //
 // Done the way EchoVR-Map-Editor's echo_editor_loader.dll serves a .kfclvl map (see its
 // loader/echo_editor_loader.cpp, Hooks C and LevelDetect, for the reverse engineering):
-//   - a .edith file (tools/make_edith_pack.py) holds an engine package: manifests/<H> and
-//     packages/<H>_N (zstd frames), plus the level it belongs to. At start it is unpacked into
-//     <plugins>\<this dll's name>\cache\<H> (only when changed);
+//   - a .edith (tools/make_edith_pack.py) holds an engine package: manifests/<H> and
+//     packages/<H>_N (zstd frames), plus the level it belongs to. It is built into EDITH.dll
+//     (RCDATA 102; a <plugins>\<this dll's name>\*.edith overrides it, for development). At start
+//     it is unpacked into %LOCALAPPDATA%\EDITH\cache\<H> (only when changed);
 //   - the engine's FileExists / FileOpen of ...\manifests\<H> and ...\packages\<H>_N are
 //     redirected there;
 //   - when that level loads (sub_1404FE050, before its resources are read), AddManifestPackage
@@ -136,84 +137,94 @@ void InstallGuard() {
     g_log("pack: guard in front of the other loader's resource hook (%zu keys of hers)", g_keys.size());
 }
 
-bool ReadAll(HANDLE h, void *dst, uint64_t n) {
-    auto p = (uint8_t *)dst;
-    while (n) {
-        DWORD k = (DWORD)(n > (1u << 30) ? (1u << 30) : n), got = 0;
-        if (!ReadFile(h, p, k, &got, nullptr) || got != k) return false;
-        p += k;
-        n -= k;
+// A .edith in memory (embedded in EDITH.dll, or a file read whole), read front to back.
+struct Reader {
+    const uint8_t *p;
+    size_t left;
+    bool Read(void *dst, uint64_t n) {
+        if (n > left) return false;
+        memcpy(dst, p, (size_t)n);
+        p += n;
+        left -= (size_t)n;
+        return true;
     }
-    return true;
-}
+};
 
 // Unpack one .edith into cache\<H>; files already there with the right size are kept.
-Pack *Unpack(const std::string &file, const std::string &cache) {
-    HANDLE h = CreateFileA(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return nullptr;
+Pack *Unpack(const uint8_t *data, size_t size, const std::string &name, const std::string &cache) {
+    Reader h = { data, size };
     struct Entry { std::string name; uint64_t size; };
     std::vector<Entry> entries;
     char magic[8];
     uint64_t package = 0, level = 0;
     uint32_t count = 0;
-    bool ok = ReadAll(h, magic, 8) && !memcmp(magic, "EDITH", 5) && (magic[5] == 1 || magic[5] == 2) && !magic[6] && !magic[7] &&
-              ReadAll(h, &package, 8) && ReadAll(h, &level, 8) && ReadAll(h, &count, 4) && count < 64;
+    bool ok = h.Read(magic, 8) && !memcmp(magic, "EDITH", 5) && (magic[5] == 1 || magic[5] == 2) && !magic[6] && !magic[7] &&
+              h.Read(&package, 8) && h.Read(&level, 8) && h.Read(&count, 4) && count < 64;
     int version = ok ? magic[5] : 0;
     for (uint32_t i = 0; ok && i < count; ++i) {
         uint16_t n = 0;
-        char name[256];
-        uint64_t size = 0;
-        ok = ReadAll(h, &n, 2) && n < sizeof name && ReadAll(h, name, n) && ReadAll(h, &size, 8);
-        name[ok ? n : 0] = 0;
-        for (char *c = name; *c; ++c) if (*c == '/') *c = '\\';
-        if (ok && (strstr(name, "..") || (strncmp(name, "manifests\\", 10) && strncmp(name, "packages\\", 9)))) ok = false;
-        entries.push_back({ name, size });
+        char nm[256];
+        uint64_t sz = 0;
+        ok = h.Read(&n, 2) && n < sizeof nm && h.Read(nm, n) && h.Read(&sz, 8);
+        nm[ok ? n : 0] = 0;
+        for (char *c = nm; *c; ++c) if (*c == '/') *c = '\\';
+        if (ok && (strstr(nm, "..") || (strncmp(nm, "manifests\\", 10) && strncmp(nm, "packages\\", 9)))) ok = false;
+        entries.push_back({ nm, sz });
     }
     std::vector<std::pair<uint64_t, uint64_t>> keys;           // v2: (type, name) of each resource
     uint32_t nkeys = 0;
-    if (ok && version >= 2) ok = ReadAll(h, &nkeys, 4) && nkeys < 100000;
+    if (ok && version >= 2) ok = h.Read(&nkeys, 4) && nkeys < 100000;
     if (ok && nkeys) {
         keys.resize(nkeys);
-        ok = ReadAll(h, keys.data(), (uint64_t)nkeys * 16);
+        ok = h.Read(keys.data(), (uint64_t)nkeys * 16);
     }
     char hex[17];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)package);
     std::string dir = cache + "\\" + hex;
-    std::vector<uint8_t> buf;
     for (size_t i = 0; ok && i < entries.size(); ++i) {
         std::string out = dir + "\\" + entries[i].name;
         CreateDirectoryA(cache.c_str(), nullptr);
         CreateDirectoryA(dir.c_str(), nullptr);
         CreateDirectoryA((dir + "\\manifests").c_str(), nullptr);
         CreateDirectoryA((dir + "\\packages").c_str(), nullptr);
+        if (entries[i].size > h.left) { ok = false; break; }
+        const uint8_t *bytes = h.p;
+        h.p += entries[i].size;
+        h.left -= (size_t)entries[i].size;
         WIN32_FILE_ATTRIBUTE_DATA fa;
         bool same = GetFileAttributesExA(out.c_str(), GetFileExInfoStandard, &fa) &&
                     (((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) == entries[i].size;
-        if (same) {                                            // (skip its bytes)
-            LARGE_INTEGER d;
-            d.QuadPart = (LONGLONG)entries[i].size;
-            ok = SetFilePointerEx(h, d, nullptr, FILE_CURRENT) != 0;
-            continue;
-        }
-        buf.resize((size_t)entries[i].size);
-        ok = ReadAll(h, buf.data(), entries[i].size);
-        HANDLE o = ok ? CreateFileA(out.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr) : INVALID_HANDLE_VALUE;
+        if (same) continue;
+        HANDLE o = CreateFileA(out.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         DWORD wrote = 0;
-        ok = o != INVALID_HANDLE_VALUE && WriteFile(o, buf.data(), (DWORD)buf.size(), &wrote, nullptr) && wrote == buf.size();
+        ok = o != INVALID_HANDLE_VALUE && WriteFile(o, bytes, (DWORD)entries[i].size, &wrote, nullptr) && wrote == entries[i].size;
         if (o != INVALID_HANDLE_VALUE) CloseHandle(o);
     }
-    CloseHandle(h);
     if (!ok) {
-        g_log("pack: %s is damaged or not a .edith file: skipped", file.c_str());
+        g_log("pack: %s is damaged or not a .edith file: skipped", name.c_str());
         return nullptr;
     }
-    auto p = new Pack;
-    p->package = package;
-    p->level = level;
-    p->dir = dir;
-    p->name = file.substr(file.find_last_of('\\') + 1);
-    p->keys = std::move(keys);
-    return p;
+    auto pk = new Pack;
+    pk->package = package;
+    pk->level = level;
+    pk->dir = dir;
+    pk->name = name;
+    pk->keys = std::move(keys);
+    return pk;
+}
+
+std::vector<uint8_t> ReadFileAll(const std::string &file) {
+    std::vector<uint8_t> out;
+    HANDLE h = CreateFileA(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    LARGE_INTEGER sz;
+    DWORD got = 0;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart < (1ll << 30)) {
+        out.resize((size_t)sz.QuadPart);
+        if (!ReadFile(h, out.data(), (DWORD)out.size(), &got, nullptr) || got != out.size()) out.clear();
+    }
+    CloseHandle(h);
+    return out;
 }
 
 // ...\manifests\<h> or ...\packages\<h>_<n> of one of ours -> its cache copy.
@@ -281,6 +292,15 @@ bool Hookable(uintptr_t rva, const uint8_t *bytes, size_t n) {
 
 int EdithPack_Install(HMODULE self, EdithPackLog log) {
     g_log = log;
+    // the cache the engine reads her package from: %LOCALAPPDATA%\EDITH\cache (nothing beside the DLL)
+    char local[MAX_PATH];
+    DWORD ln = GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH);
+    if (!ln || ln >= MAX_PATH) { log("pack: no LOCALAPPDATA: her lobby data is NOT loaded"); return 0; }
+    std::string cache = std::string(local) + "\\EDITH";
+    CreateDirectoryA(cache.c_str(), nullptr);
+    cache += "\\cache";
+    // a .edith beside the DLL (<plugins>\EDITH\*.edith, development: another lobby build) wins over
+    // the one built into the DLL
     char path[MAX_PATH];
     DWORD n = GetModuleFileNameA(self, path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 0;
@@ -289,15 +309,28 @@ int EdithPack_Install(HMODULE self, EdithPackLog log) {
     if (dot != std::string::npos && dot > root.find_last_of('\\')) root.resize(dot);   // ...\plugins\EDITH
     WIN32_FIND_DATAA fd;
     HANDLE f = FindFirstFileA((root + "\\*.edith").c_str(), &fd);
-    if (f == INVALID_HANDLE_VALUE) { log("pack: no .edith files in %s", root.c_str()); return 0; }
-    do {
-        if (Pack *p = Unpack(root + "\\" + fd.cFileName, root + "\\cache")) {
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            std::vector<uint8_t> bytes = ReadFileAll(root + "\\" + fd.cFileName);
+            if (Pack *p = Unpack(bytes.data(), bytes.size(), fd.cFileName, cache)) {
+                g_packs.push_back(p);
+                log("pack: %s (beside the DLL, over the built-in one): package %016llx for level %016llx", p->name.c_str(),
+                    (unsigned long long)p->package, (unsigned long long)p->level);
+            }
+        } while (FindNextFileA(f, &fd));
+        FindClose(f);
+    }
+    if (g_packs.empty()) {                                     // her lobby data built into EDITH.dll
+        HRSRC r = FindResourceW(self, MAKEINTRESOURCEW(102), MAKEINTRESOURCEW(10));   // RT_RCDATA
+        HGLOBAL hg = r ? LoadResource(self, r) : nullptr;
+        const uint8_t *data = hg ? (const uint8_t *)LockResource(hg) : nullptr;
+        if (!data) { log("pack: no lobby data built in"); return 0; }
+        if (Pack *p = Unpack(data, SizeofResource(self, r), "built-in mpl_lobby_b2.edith", cache)) {
             g_packs.push_back(p);
             log("pack: %s: package %016llx for level %016llx", p->name.c_str(), (unsigned long long)p->package,
                 (unsigned long long)p->level);
         }
-    } while (FindNextFileA(f, &fd));
-    FindClose(f);
+    }
     if (g_packs.empty()) return 0;
     g_base = (uint8_t *)GetModuleHandleW(nullptr);
     if (!Hookable(FILE_EXISTS_RVA, FILE_EXISTS_BYTES, sizeof FILE_EXISTS_BYTES) ||

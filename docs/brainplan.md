@@ -202,3 +202,33 @@ aimed at you to your own client on :47325, without `to=`. The new lines are in `
 - Live library: a `PUT` of `config.json` changed her "don't know" line within 2 s; a bad `chat.json`
   was refused (400) with her library unchanged; a new small talk intent added by editing the live
   file answered at once.
+
+## Her own chat model again (plan, 2026-10-19)
+
+User: she doesn't have to be smart, but she learns on her own, does what people ask, never says "sorry
+i dont understand" again, and reports toxic / rude players and bug reports to the user. Instant lines
+(her banks in EDITH.dll) stay first; new replies are rendered with Kokoro af_heart on Railway, as now.
+User chose "a pretty straight-forward, low cpu chatbot engine" (over Claude Haiku API and Gemma 4 12B).
+
+1. **Engine**: Qwen2.5-0.5B-Instruct, Q4_K_M GGUF (~400 MB), llama-cpp-python (prebuilt CPU wheel),
+   2 threads, one reply at a time, downloaded on first start to `$DATA_DIR/edith_brain/chat` like
+   Whisper and Kokoro. Env `EDITH_CHAT=0` turns it off, `EDITH_CHAT_MODEL` swaps the GGUF. ~1-2 s for a
+   one-sentence reply (to be measured on Railway); a 6 s timeout falls back to her nod line.
+2. **Where it answers**: only where `handle()` gives up today: the `unknown`, `nod` and question
+   fallbacks. Prompt: who she is (short, in her voice and rules: no emoji, never "coming"), what she
+   knows about the speaker (their profile), the last few turns, and the allowed actions. One or two
+   short spoken sentences. say_clean + her rules on the output; an action tag (`[do: come]`, from her
+   order list only) is carried out like a heard order.
+3. **Learning**: every model reply is kept as a learned answer (Postgres / JSON beside the players):
+   the same question next time answers instantly, and Kokoro's render is cached. Learned answers get
+   points from how players react (thanks / told off) and are dropped when they go bad. `GET
+   /edith/brain/learned` lists them, so popular ones can join her banks in the next EDITH.dll.
+4. **Reports**: every utterance she hears (addressed or overheard, modded players only) is checked
+   with her sentiment list plus a toxic word list and bug words (bug, glitch, crash, broken, stuck,
+   lag, exploit, "doesn't work"). A hit becomes a report {who, what, kind, when, match}: sent at once
+   to a Discord webhook (env `EDITH_REPORT_WEBHOOK`), and queued for the owner (env `EDITH_OWNER`,
+   he_is_the_cat): the next time the owner spawns in her lobby she tells them ("While you were away,
+   X was rude to me.", "Y reported a bug: ..."). `GET /edith/brain/reports` (ADMIN_TOKEN) lists them.
+   Rate-limited per player so one rant is one report.
+5. **Requests**: orders keep their instant regex path; the model's action tag covers requests worded
+   in ways the regex misses.

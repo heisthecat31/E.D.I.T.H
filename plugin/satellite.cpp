@@ -31,10 +31,17 @@
 #include <thread>
 #include <condition_variable>
 #include "detours.h"
-#include "logdir.h"
+#include "nevr_plugin.h"                                      // nEVR's plugin ABI (EchoCombat-nevr\plugin)
+#include "logdir.h"                                           // the dbgcore loader's log folder (EchoCombat\plugin)
+#ifndef EDITH_VERSION_MAJOR                                   // (build_satellite_plugin.bat passes VERSION's)
+#define EDITH_VERSION_MAJOR 0
+#define EDITH_VERSION_MINOR 0
+#define EDITH_VERSION_PATCH 0
+#endif
 #include "edith_net.h"
 #include "edith_pack.h"
 #include "edith_ears.h"
+#include "edith_voice.h"
 
 namespace {
 
@@ -48,6 +55,7 @@ float g_home[3] = { 0.0f, 2.3f, 0.0f };
 volatile int g_stage = 0;                                    // (diagnostic) where a tick faulted
 // her speaker (see "her speaker" below): declared early, the tick and the state line use them
 struct SpeakerDelegate { void *a; void *b; int64_t (*fn)(SpeakerDelegate *, int16_t *, uint16_t); };
+constexpr uint64_t SPEAKER_OBJ = 0x5341544C49544531ull;            // "SATLITE1": her speaker's game object
 struct Speaker { uint32_t playing = 0; bool registered = false; void *space = nullptr; SpeakerDelegate del = {}; } g_spk;
 float g_her_pos[3];
 volatile LONG g_her_pos_ok = 0;                                    // her position this frame is valid
@@ -89,7 +97,6 @@ char g_favour[64] = "";
 //: user 2026-10-18: "look at the person currently talking to her, even if they have a low score")
 char g_look[64] = "";
 ULONGLONG g_look_until = 0;
-char g_voice_dir[MAX_PATH] = "";                                // <plugins>\EdithVoice\ (her voice pack)
 int SlotOf(const char *name) {
     if (!name || !name[0]) return -1;
     for (int i = 0; i < g_nnames; ++i)
@@ -191,6 +198,7 @@ defer_float_fn DeferFloat = nullptr;
 void *g_set_emission = nullptr;
 
 char g_log[MAX_PATH];
+bool g_nevr = false;                                          // loaded by nEVR (BugSplat64.dll), not the dbgcore loader
 DWORD g_main_tid = 0;
 bool g_authority = false;
 thread_local bool t_busy = false;
@@ -227,6 +235,7 @@ void Log(const char *fmt, ...) {
         fprintf(f, "[%02d:%02d:%02d] %s\n", t.wHour, t.wMinute, t.wSecond, line);
         fclose(f);
     }
+    if (g_nevr) fprintf(stderr, "[EDITH] INFO %s\n", line);     // nEVR's plugin log channel
     if (g_game_log_on && GameLogFn) {
         __try { GameLog("[EDITH] %s", line); } __except (EXCEPTION_EXECUTE_HANDLER) { g_game_log_on = false; }
     }
@@ -501,6 +510,28 @@ bool NearestPlayer(const float *me, float *out, int *slot = nullptr) {
         }
     }
     return found;
+}
+
+// You have spawned in her lobby. Until then (the level is up but you're still in the loading void)
+// your own state record's head sits at a fixed placeholder, (0, 1.646, -0.012); once you spawn it is
+// your real head. Her ears and her voice wait for it (user: not the moment you're detected), and it
+// resets when her level goes.
+volatile LONG g_spawned = 0;
+void Event(const char *fmt, ...);
+void UpdateSpawned(uint8_t *ng) {
+    if (!HerAlive()) {
+        if (g_spawned) { g_spawned = 0; Log("spawn: her level is gone: her voice waits for your next spawn"); }
+        return;
+    }
+    if (g_spawned || g_own_slot < 0 || !ng) return;
+    const uint8_t *f = StateOf(ng, g_own_slot);
+    if (!f) return;
+    const float *p = (const float *)(f + HEAD_POS);
+    float dy = p[1] - 1.646f, dz = p[2] + 0.012f;
+    if (fabsf(p[0]) + fabsf(p[1]) + fabsf(p[2]) < 1e-4f || p[0] * p[0] + dy * dy + dz * dz < 0.02f * 0.02f) return;
+    g_spawned = 1;
+    Log("spawn: you're in (head %.2f %.2f %.2f): her ears and voice are on", p[0], p[1], p[2]);
+    Event("spawned");                                         // (the brain tells her owner what they missed)
 }
 
 // Player slot s's head position and velocity (the state record NearestPlayer reads); false when
@@ -1967,10 +1998,10 @@ bool SendCtl(const char *to, const char *what, float speed, const float *from) {
     return true;
 }
 
-// Her voice for everyone: the host's companion plays a line from the voice pack and says which files
-// ("voice <key> [<key>...]"); the host sends the keys to the room, and each puppet plays the same files
-// from its own <plugins>\EdithVoice through her speaker (UDP 47323, paced like the companion streams),
-// so players without the companion hear her too. Lines not in the pack (streamed) stay host-only.
+// Her voice for everyone: the host's companion plays a line and says which keys ("voice <key>
+// [<key>...]"); the host sends the keys to the room, and each puppet plays the same lines from the
+// banks inside its own EDITH.dll (edith_voice.cpp), at her, so players without the companion hear
+// her too. Games with built-in ears get the whole line instead (Ears_PlayLine).
 bool VoiceKeysOk(const char *k) {
     for (; *k; ++k)
         if (!((*k >= '0' && *k <= '9') || (*k >= 'a' && *k <= 'f') || *k == ' ')) return false;
@@ -1996,13 +2027,7 @@ void SendFace(const char *name, float seconds) {             // her face, for pu
 std::mutex g_voice_mx;
 std::condition_variable g_voice_cv;
 std::deque<std::string> g_voice_q;
-void VoiceWorker() {
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    sockaddr_in to = {};
-    to.sin_family = AF_INET;
-    to.sin_port = htons(47323);                                // her speaker (VOICE_PORT)
-    inet_pton(AF_INET, "127.0.0.1", &to.sin_addr);
-    constexpr size_t CHUNK = 24000 / 10 * 2;                   // 0.1 s of int16 mono 24 kHz
+void VoiceWorker() {                                          // (her banks: edith_voice.cpp)
     for (;;) {
         std::string keys;
         {
@@ -2011,35 +2036,20 @@ void VoiceWorker() {
             keys = g_voice_q.front();
             g_voice_q.pop_front();
         }
-        std::vector<char> pcm;
         for (size_t p = 0; p < keys.size();) {
             size_t e = keys.find(' ', p);
             std::string k = keys.substr(p, e == std::string::npos ? std::string::npos : e - p);
             p = e == std::string::npos ? keys.size() : e + 1;
             if (k.size() != 20) continue;
-            std::string path = std::string(g_voice_dir) + k + ".pcm";
-            FILE *f = nullptr;
-            if (fopen_s(&f, path.c_str(), "rb") || !f) { Log("voice: %s not in the pack", k.c_str()); continue; }
-            char buf[65536];
-            size_t n;
-            while ((n = fread(buf, 1, sizeof buf, f)) > 0) pcm.insert(pcm.end(), buf, buf + n);
-            fclose(f);
+            if (Voice_Ms(k.c_str()) < 0) { Log("voice: %s not in her banks", k.c_str()); continue; }
+            if (!g_spk.registered || !g_spawned) { Log("voice: %s dropped (her speaker isn't on, or you haven't spawned)", k.c_str()); continue; }
+            Voice_Play(k.c_str(), SPEAKER_OBJ);
         }
-        ULONGLONG t0 = GetTickCount64();
-        double sent = 0;
-        for (size_t i = 0; i + 1 < pcm.size(); i += CHUNK) {
-            int n = (int)min(CHUNK, (pcm.size() - i) & ~(size_t)1);
-            sendto(s, pcm.data() + i, n, 0, (sockaddr *)&to, sizeof to);
-            sent += n / 2 / 24000.0;
-            double ahead = sent - (GetTickCount64() - t0) / 1000.0;
-            if (ahead > 0.4) Sleep((DWORD)((ahead - 0.4) * 1000));
-        }
-        double left = sent - (GetTickCount64() - t0) / 1000.0;
-        if (left > 0) Sleep((DWORD)(left * 1000) + 400);       // her tail, then the next line
+        Sleep(400);                                            // her tail, then the next line
     }
 }
 void PlayPack(const std::string &keys) {
-    if (!g_voice_dir[0] || !VoiceKeysOk(keys.c_str())) return;
+    if (!VoiceKeysOk(keys.c_str())) return;
     static bool started = false;
     {
         std::lock_guard<std::mutex> lk(g_voice_mx);
@@ -2459,6 +2469,7 @@ netgame_update_fn Real_NetGameUpdate = nullptr;
 void __fastcall Hooked_NetGameUpdate(uint8_t *ng) {
     Real_NetGameUpdate(ng);
     g_netgame = ng;
+    if (!g_main_tid) g_main_tid = GetCurrentThreadId();       // (nEVR inits her off the main thread)
     ULONGLONG now = GetTickCount64();
     if (now - g_last_tick < TICK_MS) return;
     g_last_tick = now;
@@ -2501,6 +2512,7 @@ void __fastcall Hooked_NetGameUpdate(uint8_t *ng) {
         UpdateNet(ng);
         if (g_network && !puppet) SendState(false);
         UpdateVoip(now);                                      // who is talking on voice chat (her ears)
+        UpdateSpawned(ng);                                    // her voice and ears wait for your spawn
         if (HerAlive()) {                                     // for her speaker (RenderAudio)
             Pose hp;
             Real_TransformGet(g_her.transforms, &hp, g_her.xf);
@@ -2551,7 +2563,6 @@ typedef void (*RegistryUnregister_t)(void *, uint32_t);
 constexpr uintptr_t REGISTRY_PTR_RVA = 0x20A2FE0, REGISTRY_LOAD_RVA = 0x205466;
 constexpr uint8_t REGISTRY_LOAD_BYTES[] = { 0x48, 0x8b, 0x1d, 0x73, 0xdb, 0xe9, 0x01, 0x48, 0x83, 0xc3, 0x38 };
 constexpr uint32_t VOICE_EVENT = 0xf5b8b08d, VOICE_RATE = 24000;   // Kokoro's rate
-constexpr uint64_t SPEAKER_OBJ = 0x5341544C49544531ull;            // "SATLITE1"
 constexpr u_short VOICE_PORT = 47323;
 constexpr uint32_t RING = 1u << 19;                                // ~21 s at 24 kHz
 int16_t g_ring[RING];
@@ -2619,6 +2630,19 @@ void SpeakerOff(const char *why) {
     AkUnregisterGameObj(SPEAKER_OBJ);
     Log("speaker off (%s)", why);
     g_spk = Speaker();
+}
+
+// EDITH.ini voice_test=<key>: that line from her embedded banks (edith_voice.cpp), three times
+// 15 s apart once her speaker is on, to hear a bank line play in game.
+char g_voice_test[32] = "";
+DWORD WINAPI VoiceTest(LPVOID) {
+    for (int k = 0; k < 3;) {
+        Sleep(k ? 15000 : 5000);
+        if (!g_spk.registered || !g_spk.playing) continue;
+        bool ok = Voice_Play(g_voice_test, SPEAKER_OBJ);
+        Log("voice test %d: %s %s (%d ms)", ++k, g_voice_test, ok ? "played from its bank" : "FAILED", Voice_Ms(g_voice_test));
+    }
+    return 0;
 }
 
 // RenderAudio (game thread, before Wwise renders): our speaker on, at her.
@@ -2833,7 +2857,7 @@ bool VoipInstall(uint8_t *base) {
 // ---- her built-in ears (edith_ears.cpp): what they ask of the DLL ----------------------------------
 char g_brain_url[256] = "wss://sparkapi-production-e6df.up.railway.app/edith/brain";
 char g_mic[32] = "default";
-bool EarsInLobby() { return g_her_pos_ok != 0; }
+bool EarsInLobby() { return g_her_pos_ok != 0 && g_spawned; }   // (her ears wait for your spawn)
 bool EarsMuted() { return g_muted == 1; }
 bool EarsPuppet() { return !strcmp(g_net_role, "puppet"); }
 bool EarsHasEars(const char *name) {                          // in the room's ai list (their own game hears them)
@@ -2896,12 +2920,14 @@ std::string JObj(const std::string &s, const char *key) {
 }
 bool EarsSpeakerPush(const int16_t *pcm, size_t n) {
     LONG64 wr = g_wr;
-    if (!g_spk.playing || (size_t)(wr - g_rd) + n > RING - VOICE_RATE / 10) return false;   // (no room / no speaker)
+    if (!g_spawned || !g_spk.playing || (size_t)(wr - g_rd) + n > RING - VOICE_RATE / 10) return false;   // (no room / no speaker / not spawned)
     for (size_t k = 0; k < n; ++k) g_ring[(wr + k) & (RING - 1)] = pcm[k];
     g_wr = wr + (LONG64)n;
     return true;
 }
 size_t EarsSpeakerPending() { LONG64 d = g_wr - g_rd; return d > 0 ? (size_t)d : 0; }
+int EarsBankMs(const char *key) { return Voice_Ms(key); }
+bool EarsBankPlay(const char *key) { return g_spawned && g_spk.registered && Voice_Play(key, SPEAKER_OBJ); }
 
 void StartEars() {
     EarsHost h = {};
@@ -2915,7 +2941,9 @@ void StartEars() {
     h.voice_line = EarsVoiceLine;
     h.speaker_push = EarsSpeakerPush;
     h.speaker_pending = EarsSpeakerPending;
-    Ears_Start(h, g_brain_url, g_voice_dir, g_mic);
+    h.bank_ms = EarsBankMs;
+    h.bank_play = EarsBankPlay;
+    Ears_Start(h, g_brain_url, g_mic);
 }
 
 // Her AI (EDITH.ini ai=<path to run_edith_ears.ps1>): started without a window when the game
@@ -3028,64 +3056,179 @@ DWORD WINAPI Install(LPVOID) {
 
 }  // namespace
 
+// Her settings: built into the DLL (the defaults below match her embedded lobby build), each one
+// overridable by nEVR's config.yaml args for this plugin (the launcher's Options: a flat JSON object
+// of strings, e.g. {"local":"0","mic":"off"}) and, for development, by an EDITH.ini [satellite] beside
+// the DLL (nothing ships with it). Args win over the ini.
+std::vector<std::pair<std::string, std::string>> g_args;
+char g_ini[MAX_PATH] = "";
+
+void ParseArgs(const char *json) {                            // {"key":"value",...}, strings only
+    if (!json) return;
+    const char *p = json;
+    auto str = [&](std::string &out) {
+        while (*p && *p != '"') ++p;
+        if (*p != '"') return false;
+        for (++p; *p && *p != '"'; ++p) {
+            if (*p == '\\' && p[1]) ++p;
+            out += *p;
+        }
+        if (*p == '"') ++p;
+        return true;
+    };
+    for (;;) {
+        std::string k, v;
+        if (!str(k)) break;
+        while (*p && *p != ':') ++p;
+        if (!*p) break;
+        ++p;
+        if (!str(v)) break;
+        g_args.emplace_back(k, v);
+    }
+}
+
+bool CfgStr(const char *key, const char *def, char *out, DWORD size) {
+    for (auto &kv : g_args)
+        if (!_stricmp(kv.first.c_str(), key)) { strncpy_s(out, size, kv.second.c_str(), _TRUNCATE); return true; }
+    char v[512];                                              // (not into `out`: it may hold the default)
+    if (g_ini[0] && GetPrivateProfileStringA("satellite", key, "\x01", v, sizeof v, g_ini) && v[0] != '\x01') {
+        strncpy_s(out, size, v, _TRUNCATE);
+        return true;
+    }
+    if (out != def) strncpy_s(out, size, def ? def : "", _TRUNCATE);
+    return false;
+}
+int CfgInt(const char *key, int def) {
+    char b[64];
+    return CfgStr(key, "", b, sizeof b) && b[0] ? atoi(b) : def;
+}
+float CfgFloat(const char *key, float def) {
+    char b[64];
+    return CfgStr(key, "", b, sizeof b) && b[0] ? (float)atof(b) : def;
+}
+
+// Everything she sets up at start: the dbgcore loader runs it from DllMain, nEVR from
+// NvrPluginInitEx (nothing may be hooked in DllMain there: nEVR may unload a DLL that fails its
+// checks right after loading it).
+static void Start(HMODULE self, bool server, const char *args) {
+    if (g_nevr) EchoCombatLogPath(g_log, sizeof g_log, "EDITH");   // bin\win10\plugin_logs\EDITH\EDITH.log
+    else {
+        EchoCombatLogPath(self, 3, "EDITH.log", g_log, sizeof g_log);   // _local\echoCombatBetaLogs\EDITH.log
+        g_main_tid = GetCurrentThreadId();                // (dbgcore loads her on the main thread)
+    }
+    const char *cmd = GetCommandLineA();
+    g_authority = server || strstr(cmd, "-offline");
+    g_server = server;
+    ParseArgs(args);
+    GetModuleFileNameA(self, g_ini, MAX_PATH);
+    if (char *dot = strrchr(g_ini, '.')) strcpy_s(dot, g_ini + MAX_PATH - dot, ".ini");
+    if (GetFileAttributesA(g_ini) == INVALID_FILE_ATTRIBUTES) g_ini[0] = 0;
+    if (!g_authority) g_local = CfgInt("local", 1) != 0;      // (a public lobby's server doesn't run her)
+    Log("EDITH.dll loaded (pid %lu, main thread %lu)", GetCurrentProcessId(), g_main_tid);
+    EdithPack_Install(self, Log);                         // her lobby data from <plugins>\<dll name>\*.edith (no repack)
+    unsigned index = CfgInt("index", 659);
+    HER_ACTOR = 0x0000FFFFFFFF0000ull | (index & 0xffff);
+    g_jet_test = CfgInt("jets_test", 0) != 0;
+    g_snow_first = CfgInt("snow_first", 661);
+    g_snow_count = g_snow_first ? CfgInt("snow_count", 6) : 0;
+    if (g_snow_count > 16) g_snow_count = 16;
+    g_snow_test = CfgInt("snow_test", 0) != 0;
+    g_face_first = CfgInt("face_first", 667);
+    g_face_count = g_face_first ? CfgInt("face_count", 5) : 0;
+    g_network = CfgInt("network", 1) != 0;            // docs/networkplan.md
+    g_hear_voip = CfgInt("hear_voip", 1) != 0;        // her ears on voice chat
+    g_verbose = CfgInt("verbose", 0) != 0;
+    Voice_Init(self, Log);                                // her lines as banks inside this DLL
+    CfgStr("voice_test", "", g_voice_test, sizeof g_voice_test);
+    if (g_voice_test[0]) CreateThread(nullptr, 0, VoiceTest, nullptr, 0, nullptr);
+    g_ai_console = CfgInt("ai_console", 0) != 0;
+    CfgStr("relay", g_relay, g_relay, sizeof g_relay);
+    CfgStr("my_name", "", g_my_name, sizeof g_my_name);
+    CfgStr("debug_roster", "", g_debug_roster, sizeof g_debug_roster);
+    if (g_debug_roster[0]) Log("edith net: debug_roster %s (fake players in your match)", g_debug_roster);
+    g_voice_gain = CfgFloat("voice_gain", g_voice_gain);
+    g_voice_full = CfgFloat("voice_full", g_voice_full);
+    g_voice_cutoff = CfgFloat("voice_cutoff", g_voice_cutoff);
+    CfgStr("ai", "", g_ai_script, sizeof g_ai_script);
+    char ears[16];                                        // her ears: built in (dll), the Python companion
+    CfgStr("ears", "dll", ears, sizeof ears);   // (python, ai=), or off
+    CfgStr("brain", g_brain_url, g_brain_url, sizeof g_brain_url);
+    CfgStr("mic", g_mic, g_mic, sizeof g_mic);
+    g_ears_dll = !_stricmp(ears, "dll") && !g_server;     // (a dedicated server has no player to hear)
+    if (_stricmp(ears, "python")) g_ai_script[0] = 0;     // built in or off: no Python companion
+    g_ai_configured = g_ears_dll || (g_ai_script[0] && GetFileAttributesA(g_ai_script) != INVALID_FILE_ATTRIBUTES);
+    if (g_ai_script[0] && GetFileAttributesA(g_ai_script) != INVALID_FILE_ATTRIBUTES)
+        CreateThread(nullptr, 0, LaunchAI, nullptr, 0, nullptr);
+    else if (g_ai_script[0]) Log("ai: %s not found", g_ai_script);
+    Log("snowball pool: %u from actor index %u", g_snow_count, g_snow_first);
+    const char *keys[3] = { "x", "y", "z" };
+    for (int k = 0; k < 3; ++k)
+        g_home[k] = CfgFloat(keys[k], g_home[k]);
+    Log("her actor %016llx, built at (%.2f %.2f %.2f) (settings: built in%s%s)", HER_ACTOR, g_home[0], g_home[1], g_home[2],
+        g_args.empty() ? "" : ", nEVR args", g_ini[0] ? ", EDITH.ini" : "");
+    Install(nullptr);
+}
+
+// ---- the two hosts --------------------------------------------------------------------------------
+// One EDITH.dll for both: nEVR (its BugSplat64.dll loads the plugins its config.yaml lists, then
+// calls NvrPluginInitEx; nothing may be hooked in DllMain there) and the dbgcore plugin loader
+// (EchoCombat plugin/loader.cpp: it loads every DLL in plugins\ and calls nothing, so she starts
+// from DllMain, as she always did).
+static HMODULE g_module = nullptr;
+static volatile LONG g_started = 0;
+
+// nEVR's BugSplat64.dll exports its NEVR_* API; the stock one (630,288 bytes) exports none. Another
+// host of the same plugin ABI (EchoLoader 2) also replaces it with a far bigger file.
+static bool NevrHost() {
+    HMODULE bs = GetModuleHandleW(L"BugSplat64.dll");
+    if (!bs) return false;
+    if (GetProcAddress(bs, "NEVR_SetGameModule")) return true;
+    wchar_t path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    DWORD n = GetModuleFileNameW(bs, path, MAX_PATH);
+    return n && n < MAX_PATH && GetFileAttributesExW(path, GetFileExInfoStandard, &a) &&
+           (a.nFileSizeHigh || a.nFileSizeLow > 1000000);
+}
+
+ECHOCOMBAT_EXPORT NvrPluginInfo NvrPluginGetInfo(void) {
+    NvrPluginInfo info = {};
+    info.name = "edith";
+    info.description = "E.D.I.T.H: the satellite in the Echo VR lobby";
+    info.version_major = EDITH_VERSION_MAJOR;
+    info.version_minor = EDITH_VERSION_MINOR;
+    info.version_patch = EDITH_VERSION_PATCH;
+    return info;
+}
+
+ECHOCOMBAT_EXPORT uint32_t NvrPluginGetApiVersion(void) { return NEVR_PLUGIN_API_VERSION; }
+
+ECHOCOMBAT_EXPORT uint32_t NvrPluginGetCapabilities(void) {
+    return NEVR_PLUGIN_CAP_COSMETIC | NEVR_PLUGIN_CAP_NETWORK | NEVR_PLUGIN_CAP_HOOKS_ENGINE;
+}
+
+// No NvrPluginShutdown yet (docs/nevr_plan.md step 3): her hooks and threads are never undone, and
+// nevr-runtime's UnloadPlugins FreeLibrarys every plugin at exit, so she pins herself in memory
+// first: a hook left pointing at unmapped code would crash the game's last frames. If the dbgcore
+// loader already started her (both hosts in one game), this does nothing.
+ECHOCOMBAT_EXPORT int NvrPluginInitEx(const NvrGameContext *ctx, const char *args) {
+    if (InterlockedExchange(&g_started, 1)) return 0;
+    HMODULE pinned;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                       (LPCWSTR)&NvrPluginInitEx, &pinned);
+    g_nevr = true;
+    Start(g_module, EchoCombatIsServer(ctx), args);
+    return 0;
+}
+
+ECHOCOMBAT_EXPORT int NvrPluginInit(const NvrGameContext *ctx) { return NvrPluginInitEx(ctx, "{}"); }
+
 BOOL WINAPI DllMain(HMODULE self, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(self);
-        EchoCombatLogPath(self, 3, "EDITH.log", g_log, sizeof g_log);
-        g_main_tid = GetCurrentThreadId();
-        const char *cmd = GetCommandLineA();
-        g_authority = strstr(cmd, "-server") || strstr(cmd, "-offline");
-        g_server = strstr(cmd, "-server") != nullptr;
-        if (!g_authority) {
-            char ini0[MAX_PATH];
-            GetModuleFileNameA(self, ini0, MAX_PATH);
-            if (char *dot = strrchr(ini0, '.')) strcpy_s(dot, ini0 + MAX_PATH - dot, ".ini");
-            g_local = GetPrivateProfileIntA("satellite", "local", 0, ini0) != 0;
-        }
-        Log("EDITH.dll loaded (pid %lu, main thread %lu)", GetCurrentProcessId(), g_main_tid);
-        EdithPack_Install(self, Log);                         // her lobby data from <plugins>\<dll name>\*.edith (no repack)
-        char ini[MAX_PATH], buf[64];
-        GetModuleFileNameA(self, ini, MAX_PATH);
-        strcpy_s(g_voice_dir, ini);                           // <plugins>\EdithVoice\ next to the DLL
-        if (char *sl = strrchr(g_voice_dir, '\\')) strcpy_s(sl + 1, g_voice_dir + MAX_PATH - (sl + 1), "EdithVoice\\");
-        if (char *dot = strrchr(ini, '.')) strcpy_s(dot, ini + MAX_PATH - dot, ".ini");
-        unsigned index = GetPrivateProfileIntA("satellite", "index", 659, ini);
-        HER_ACTOR = 0x0000FFFFFFFF0000ull | (index & 0xffff);
-        g_jet_test = GetPrivateProfileIntA("satellite", "jets_test", 0, ini) != 0;
-        g_snow_first = GetPrivateProfileIntA("satellite", "snow_first", 0, ini);
-        g_snow_count = g_snow_first ? GetPrivateProfileIntA("satellite", "snow_count", 0, ini) : 0;
-        if (g_snow_count > 16) g_snow_count = 16;
-        g_snow_test = GetPrivateProfileIntA("satellite", "snow_test", 0, ini) != 0;
-        g_face_first = GetPrivateProfileIntA("satellite", "face_first", 0, ini);
-        g_face_count = g_face_first ? GetPrivateProfileIntA("satellite", "face_count", 0, ini) : 0;
-        g_network = GetPrivateProfileIntA("satellite", "network", 1, ini) != 0;            // docs/networkplan.md
-        g_hear_voip = GetPrivateProfileIntA("satellite", "hear_voip", 1, ini) != 0;        // her ears on voice chat
-        g_verbose = GetPrivateProfileIntA("satellite", "verbose", 0, ini) != 0;
-        g_ai_console = GetPrivateProfileIntA("satellite", "ai_console", 0, ini) != 0;
-        GetPrivateProfileStringA("satellite", "relay", g_relay, g_relay, sizeof g_relay, ini);
-        GetPrivateProfileStringA("satellite", "my_name", "", g_my_name, sizeof g_my_name, ini);
-        GetPrivateProfileStringA("satellite", "debug_roster", "", g_debug_roster, sizeof g_debug_roster, ini);
-        if (g_debug_roster[0]) Log("edith net: debug_roster %s (fake players in your match)", g_debug_roster);
-        if (GetPrivateProfileStringA("satellite", "voice_gain", "", buf, sizeof buf, ini)) g_voice_gain = (float)atof(buf);
-        if (GetPrivateProfileStringA("satellite", "voice_full", "", buf, sizeof buf, ini)) g_voice_full = (float)atof(buf);
-        if (GetPrivateProfileStringA("satellite", "voice_cutoff", "", buf, sizeof buf, ini)) g_voice_cutoff = (float)atof(buf);
-        GetPrivateProfileStringA("satellite", "ai", "", g_ai_script, sizeof g_ai_script, ini);
-        char ears[16];                                        // her ears: built in (dll), the Python companion
-        GetPrivateProfileStringA("satellite", "ears", "dll", ears, sizeof ears, ini);   // (python, ai=), or off
-        GetPrivateProfileStringA("satellite", "brain", g_brain_url, g_brain_url, sizeof g_brain_url, ini);
-        GetPrivateProfileStringA("satellite", "mic", g_mic, g_mic, sizeof g_mic, ini);
-        g_ears_dll = !_stricmp(ears, "dll") && !g_server;     // (a dedicated server has no player to hear)
-        if (_stricmp(ears, "python")) g_ai_script[0] = 0;     // built in or off: no Python companion
-        g_ai_configured = g_ears_dll || (g_ai_script[0] && GetFileAttributesA(g_ai_script) != INVALID_FILE_ATTRIBUTES);
-        if (g_ai_script[0] && GetFileAttributesA(g_ai_script) != INVALID_FILE_ATTRIBUTES)
-            CreateThread(nullptr, 0, LaunchAI, nullptr, 0, nullptr);
-        else if (g_ai_script[0]) Log("ai: %s not found", g_ai_script);
-        Log("snowball pool: %u from actor index %u", g_snow_count, g_snow_first);
-        const char *keys[3] = { "x", "y", "z" };
-        for (int k = 0; k < 3; ++k)
-            if (GetPrivateProfileStringA("satellite", keys[k], "", buf, sizeof buf, ini)) g_home[k] = (float)atof(buf);
-        Log("her actor %016llx, built at (%.2f %.2f %.2f) (%s)", HER_ACTOR, g_home[0], g_home[1], g_home[2], ini);
-        Install(nullptr);
+        g_module = self;
+        // under nEVR, wait for NvrPluginInitEx; under the dbgcore loader, start now
+        if (!NevrHost() && !InterlockedExchange(&g_started, 1))
+            Start(self, strstr(GetCommandLineA(), "-server") != nullptr, "{}");
     }
     return TRUE;
 }

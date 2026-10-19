@@ -4,7 +4,7 @@
 //   up:   every event line the DLL makes ({"t":"dll"}), your mic's speech and the room's voice chat
 //         (EDA1 utterances, int16 mono 16 kHz)
 //   down: replies (face, orders, her line) -> the DLL; her line from the voice pack or streamed
-//         (EDV1, 24 kHz) into her in-game speaker
+//         (EDV1, 24 kHz) into her in-game speaker; lines in her banks play from EDITH.dll
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -23,11 +23,13 @@ struct EarsHost {
     void (*voice_line)(const char *keys, const char *line_json);
     bool (*speaker_push)(const int16_t *pcm, size_t n);   // into her speaker (false: no room right now)
     size_t (*speaker_pending)();                // samples still queued in her speaker
+    int (*bank_ms)(const char *key);            // her bank line's length in ms, -1: no bank has it
+    bool (*bank_play)(const char *key);         // plays her bank line at her, waits for its end
 };
 
-// Starts the threads. brain_url: wss://.../edith/brain. voice_dir: <plugins>\EdithVoice\ (with the
-// trailing slash). mic: "default" (the default recording device) | "communications" | "off".
-void Ears_Start(const EarsHost &host, const char *brain_url, const char *voice_dir, const char *mic);
+// Starts the threads. brain_url: wss://.../edith/brain. mic: "default" (the default recording device)
+// | "communications" | "off".
+void Ears_Start(const EarsHost &host, const char *brain_url, const char *mic);
 
 // An event line the DLL made (state, event ... by=, mute, heard, net ...): up to the brain as is.
 void Ears_Line(const char *line);

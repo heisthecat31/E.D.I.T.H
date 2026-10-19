@@ -3,7 +3,8 @@
 // alone, nothing in their game talked to the brain (user, 2026-10-18: "why does he only hear her
 // when I'm in the lobby"). Threads:
 //   link   WinHTTP WebSocket to the brain (reconnects), a sender and a receiver (as edith_net.cpp)
-//   voice  her replies, one at a time: pack file (<plugins>\EdithVoice\<key>.pcm) or streamed render
+//   voice  her replies, one at a time: a bank inside EDITH.dll (edith_voice.cpp), a line streamed earlier
+//          this session (kept in memory), or streamed from the brain
 //   mic    WASAPI shared capture of the default recording device -> 16 kHz mono -> speech by level
 //   voip   other players' voice chat (copied on Wwise's thread) -> speech by level, by name
 // Speech found by level against a moving noise floor, exactly as the Python companion (30 ms frames,
@@ -34,7 +35,7 @@
 namespace {
 
 EarsHost H;
-std::string g_url, g_voice_dir, g_mic = "default";
+std::string g_url, g_mic = "default";
 constexpr const char *BUILD = "ears-dll-1";
 constexpr uint32_t RATE = 24000;                    // her voice: int16 mono 24 kHz
 constexpr float SPEECH_LEVEL = 2.5f;                // speech = this many times the noise floor
@@ -316,14 +317,31 @@ void Link() {
 }
 
 // ---- her voice -----------------------------------------------------------------------------------------
-bool FileOf(const std::string &key, std::string &path, long long &bytes) {
-    if (key.size() != 20 || g_voice_dir.empty()) return false;
+// Lines the brain streamed this session, by key: played from here the next time (memory only, nothing
+// is written beside the DLL). KEPT_MAX bytes at most; past that, new lines aren't kept.
+std::mutex g_kmx;
+std::map<std::string, std::string> g_kept;
+size_t g_kept_bytes = 0;
+constexpr size_t KEPT_MAX = 64u << 20;
+
+bool KeyOk(const std::string &key) {
+    if (key.size() != 20) return false;
     for (char ch : key)
         if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
-    path = g_voice_dir + key + ".pcm";
-    WIN32_FILE_ATTRIBUTE_DATA a;
-    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) return false;
-    bytes = ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    return true;
+}
+
+// Whether she has `key` without streaming it: path "bank:<key>" (her banks) or "mem:<key>" (kept
+// this session), and its length in int16 bytes.
+bool FileOf(const std::string &key, std::string &path, long long &bytes) {
+    if (!KeyOk(key)) return false;
+    int ms = H.bank_ms(key.c_str());
+    if (ms >= 0) { path = "bank:" + key; bytes = (long long)ms * RATE * 2 / 1000; return true; }
+    std::lock_guard<std::mutex> lk(g_kmx);
+    auto it = g_kept.find(key);
+    if (it == g_kept.end()) return false;
+    path = "mem:" + key;
+    bytes = (long long)it->second.size();
     return true;
 }
 
@@ -393,23 +411,17 @@ bool Push(const char *data, size_t bytes) {
     return true;
 }
 
-// A streamed line into the pack folder under its key, so the next time it plays from there (each
-// game streams a new line once). Only a whole render; written to a temp file, then renamed.
+// A streamed line kept in memory under its key, so the next time it plays from there (each game
+// streams a new line once). Only a whole render.
 void Keep(const std::string &key, const std::string &pcm, bool complete) {
     std::string path;
     long long b;
-    if (!complete || pcm.size() < 4800 || key.size() != 20 || g_voice_dir.empty() || FileOf(key, path, b)) return;
-    for (char ch : key)
-        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return;
-    path = g_voice_dir + key + ".pcm";
-    std::string tmp = path + ".part";
-    FILE *f = nullptr;
-    if (fopen_s(&f, tmp.c_str(), "wb") || !f) return;
-    bool ok = fwrite(pcm.data(), 1, pcm.size(), f) == pcm.size();
-    fclose(f);
-    if (ok && MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
-        ELOG("ears: kept the streamed line in the pack (%s, %.1f s)", key.c_str(), pcm.size() / 2.0 / RATE);
-    else DeleteFileA(tmp.c_str());
+    if (!complete || pcm.size() < 4800 || !KeyOk(key) || FileOf(key, path, b)) return;
+    std::lock_guard<std::mutex> lk(g_kmx);
+    if (g_kept_bytes + pcm.size() > KEPT_MAX) return;
+    g_kept[key] = pcm;
+    g_kept_bytes += pcm.size();
+    ELOG("ears: kept the streamed line in memory (%s, %.1f s)", key.c_str(), pcm.size() / 2.0 / RATE);
 }
 
 void VoiceThread() {
@@ -451,13 +463,18 @@ void VoiceThread() {
         for (auto &it : items) {
             if (!ok) break;
             if (it.file) {
-                FILE *f = nullptr;
-                if (fopen_s(&f, it.path_or_text.c_str(), "rb") || !f) continue;
-                std::vector<char> pcm;
-                char buf[65536];
-                size_t n;
-                while ((n = fread(buf, 1, sizeof buf, f)) > 0) pcm.insert(pcm.end(), buf, buf + n);
-                fclose(f);
+                if (!it.path_or_text.compare(0, 5, "bank:")) {     // her bank: the game's sound engine plays it
+                    for (int k = 0; k < 600 && H.speaker_pending() > 0; ++k) Sleep(20);   // after what's streaming
+                    ok = H.bank_play(it.key.c_str());
+                    continue;
+                }
+                std::string pcm;
+                {
+                    std::lock_guard<std::mutex> lk(g_kmx);
+                    auto f = g_kept.find(it.key);
+                    if (f == g_kept.end()) continue;
+                    pcm = f->second;
+                }
                 ok = Push(pcm.data(), pcm.size());
                 continue;
             }
@@ -683,12 +700,11 @@ void VoipThread() {
 
 }  // namespace
 
-void Ears_Start(const EarsHost &host, const char *brain_url, const char *voice_dir, const char *mic) {
+void Ears_Start(const EarsHost &host, const char *brain_url, const char *mic) {
     H = host;
     g_url = brain_url ? brain_url : "";
-    g_voice_dir = voice_dir ? voice_dir : "";
     if (mic && *mic) g_mic = mic;
-    ELOG("ears: built in (brain %s, voice pack %s, mic %s)", g_url.c_str(), g_voice_dir.c_str(), g_mic.c_str());
+    ELOG("ears: built in (brain %s, voice from her banks, mic %s)", g_url.c_str(), g_mic.c_str());
     std::thread(Link).detach();
     std::thread(VoiceThread).detach();
     std::thread(MicThread).detach();
