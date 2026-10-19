@@ -14,6 +14,12 @@ typedef uint32_t (*AkPostEvent_t)(uint32_t, uint64_t, uint32_t, void *, void *, 
 AkLoadBankMem_t LoadBank = nullptr;
 AkUnloadBankMem_t UnloadBank = nullptr;
 AkPostEvent_t PostEvent = nullptr;
+typedef void (*AkStopPlayingID_t)(uint32_t, int32_t, int);                    // id, fade ms, curve
+AkStopPlayingID_t StopPlayingID = nullptr;
+constexpr int32_t STOP_FADE_MS = 80;
+constexpr int CURVE_LINEAR = 4;                                // AkCurveInterpolation_Linear
+volatile uint32_t g_playing = 0;                               // the line's playing id (0: none)
+HANDLE g_stop = nullptr;                                       // set: cut the line short
 
 #pragma pack(push, 1)
 struct Row { char key[20]; uint32_t event, bank, offset, size, ms; };
@@ -45,6 +51,9 @@ int Voice_Init(HMODULE self, EdithVoiceLog log) {
     LoadBank = (AkLoadBankMem_t)GetProcAddress(exe, "?LoadBank@SoundEngine@AK@@YA?AW4AKRESULT@@PEBXKAEAK@Z");
     UnloadBank = (AkUnloadBankMem_t)GetProcAddress(exe, "?UnloadBank@SoundEngine@AK@@YA?AW4AKRESULT@@KPEBXPEAJ@Z");
     PostEvent = (AkPostEvent_t)GetProcAddress(exe, "?PostEvent@SoundEngine@AK@@YAKK_KKP6AXW4AkCallbackType@@PEAUAkCallbackInfo@@@ZPEAXKPEAUAkExternalSourceInfo@@K@Z");
+    StopPlayingID = (AkStopPlayingID_t)GetProcAddress(exe, "?StopPlayingID@SoundEngine@AK@@YAXKJW4AkCurveInterpolation@@@Z");
+    if (!StopPlayingID) log("voice banks: the game's StopPlayingID not found: lines can't be cut short");
+    g_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!LoadBank || !UnloadBank || !PostEvent) { log("voice banks: the game's LoadBank / UnloadBank / PostEvent not found"); return 0; }
     HRSRC r = FindResourceW(self, MAKEINTRESOURCEW(101), MAKEINTRESOURCEW(10));   // RT_RCDATA
     HGLOBAL h = r ? LoadResource(self, r) : nullptr;
@@ -59,6 +68,10 @@ int Voice_Init(HMODULE self, EdithVoiceLog log) {
     g_count = n;
     log("voice banks: %u line(s) embedded (%lu bytes)", n, size);
     return (int)n;
+}
+
+void Voice_Stop() {
+    if (g_stop && g_playing) SetEvent(g_stop);
 }
 
 int Voice_Ms(const char *key) {
@@ -81,9 +94,17 @@ bool Voice_Play(const char *key, uint64_t obj) {
         _aligned_free(mem);
         return false;
     }
+    ResetEvent(g_stop);
     uint32_t playing = PostEvent(r->event, obj, 0, nullptr, nullptr, 0, nullptr, 0);
     if (!playing) g_log("voice banks: PostEvent(%u) on %016llx failed (%.20s)", r->event, obj, r->key);
-    else Sleep(r->ms + 300);                                   // the line, and a little of its tail
+    else {
+        g_playing = playing;
+        if (WaitForSingleObject(g_stop, r->ms + 300) == WAIT_OBJECT_0) {   // the line, and a little of its tail
+            if (StopPlayingID) StopPlayingID(playing, STOP_FADE_MS, CURVE_LINEAR);   // cut short
+            Sleep(STOP_FADE_MS + 120);                         // (faded out before its bank goes)
+        }
+        g_playing = 0;
+    }
     int32_t pool = 0;
     rc = UnloadBank(bank, mem, &pool);
     if (rc != 1) g_log("voice banks: UnloadBank(%.20s) = %d (its memory stays)", r->key, rc);

@@ -232,6 +232,13 @@ constexpr float SOCIAL_RADIUS = 6.0f;    // m: a barrier hit this close to it is
 volatile ULONGLONG g_barrier_at = 0;
 ULONGLONG g_hopped_until = 0;                                 // a hop isn't a hit (her jump read as speed)
 constexpr DWORD HOP_QUIET_MS = 400;
+// Stuck: trying to get somewhere (more than STUCK_FAR off her spot) but not STUCK_MOVE further on in
+// STUCK_MS: she teleports home (user, 2026-10-19: "if she gets stuck in one place even when no one
+// has told her to stay she needs to teleport back to spawn"). Never while she was told to stay.
+constexpr float STUCK_FAR = 1.5f, STUCK_MOVE = 0.5f;
+constexpr DWORD STUCK_MS = 20000;
+float g_stuck_at[3] = {};
+ULONGLONG g_stuck_since = 0;
 game_log_fn Real_GameLogV = nullptr;
 
 bool BarrierPrint(const char *fmt, va_list a) {
@@ -1641,6 +1648,24 @@ void Tick() {
             g_orders.order = O_STAY;
             Event("event arrived");
         }
+        {                                                     // stuck? back to spawn
+            float m[3] = { me.p[0] - g_stuck_at[0], me.p[1] - g_stuck_at[1], me.p[2] - g_stuck_at[2] };
+            if (o == O_STAY || o == O_SPIN || dist <= STUCK_FAR || Len(m) > STUCK_MOVE || !g_stuck_since) {
+                memcpy(g_stuck_at, me.p, 12);
+                g_stuck_since = now;
+            } else if (now - g_stuck_since > STUCK_MS && WorldTeleport) {
+                float xf[8] = { me.q[0], me.q[1], me.q[2], me.q[3], g_home[0], g_home[1], g_home[2], 1 };
+                WorldTeleport(g_her.space, HER_ACTOR, xf, 0);
+                Log("stuck at (%.2f %.2f %.2f) for %lu s, %.2f m from where she's going (%s): teleported home",
+                    me.p[0], me.p[1], me.p[2], (unsigned long)(STUCK_MS / 1000), dist, OrderName(o));
+                Event("event stuck teleported home");
+                memcpy(g_brain.pos, g_home, 12);
+                memcpy(g_stuck_at, g_home, 12);
+                g_stuck_since = now;
+                g_hopped_until = now + HOP_QUIET_MS;          // (the jump isn't a hit)
+                g_roam_at = -1;                               // (roaming: on from the nearest node)
+            }
+        }
         if (o == O_APPROACH && dist < 0.35f) {                // there: she hovers by them (the brain talks)
             g_orders.order = O_FOLLOW;
             Event("event approached to=%s", g_orders.who);
@@ -2308,6 +2333,10 @@ void SendBall(unsigned k, const float *at, const float *v, bool held) {   // any
              k, at[0], at[1], at[2], v[0], v[1], v[2], held ? 1 : 0);
     EdithNet_SendText(b);
 }
+void SendHush(const char *by) {                              // someone talked over her: every game stops her
+    if (strcmp(g_net_role, "host") && strcmp(g_net_role, "puppet")) return;
+    EdithNet_SendText(std::string("{\"t\":\"hush\",\"by\":\"") + JEsc(by ? by : "") + "\"}");
+}
 void SendFace(const char *name, float seconds) {             // her face, for puppets without a companion
     if (strcmp(g_net_role, "host")) return;
     char b[128];
@@ -2456,6 +2485,11 @@ void TakeNet() {
         } else if (t == "snow" && !host && from == g_net_host) {  // ...threw a ball
             float at[3], v[3];
             if (JVec(m.data, "pos", at) && JVec(m.data, "vel", v)) LaunchSnow((unsigned)JNum(m.data, "k", 0), at, v);
+        } else if (t == "hush" && from != g_me) {             // someone talked over her on their game
+            Log("hush from %s (%s talked over her)", from.c_str(), JStr(m.data, "by").c_str());
+            if (g_ears_dll) Ears_Hush(JStr(m.data, "by").c_str());
+            if (!host) continue;                              // (the host's brain hears it as an event)
+            Event("event interrupted by=%s", JStr(m.data, "by").c_str());
         } else if (t == "ball" && from != g_me) {             // someone's hand on one of her balls
             float at[3], v[3];
             if (JVec(m.data, "pos", at) && JVec(m.data, "vel", v))
@@ -2862,6 +2896,7 @@ constexpr uint32_t RING = 1u << 19;                                // ~21 s at 2
 int16_t g_ring[RING];
 volatile LONG64 g_wr = 0, g_rd = 0;
 bool g_primed = false;
+volatile bool g_flush = false;                                     // drop what's queued (she was talked over)
 float g_voice_gain = 0.8f;                                         // EDITH.ini voice_gain
 float g_voice_full = 1.5f, g_voice_cutoff = 20.0f;                 // m: full volume within, silent from
 volatile float g_dist_gain = 1.0f;                                 // set per frame from your distance to her
@@ -2871,6 +2906,7 @@ int64_t FillSpeaker(SpeakerDelegate *, int16_t *out, uint16_t n) {
     static float cur = 1.0f;                                       // ramps to the distance gain over a buffer
     float target = g_dist_gain * g_voice_gain, step = n ? (target - cur) / n : 0.0f;
     LONG64 wr = g_wr, rd = g_rd, have = wr - rd;
+    if (g_flush) { g_flush = false; rd = wr; have = 0; g_primed = false; g_rd = rd; }   // (only this thread moves rd)
     if (!g_primed && have >= (LONG64)(VOICE_RATE * 12 / 100)) g_primed = true;
     uint16_t i = 0;
     if (g_primed) {
@@ -3222,6 +3258,10 @@ bool EarsSpeakerPush(const int16_t *pcm, size_t n) {
 size_t EarsSpeakerPending() { LONG64 d = g_wr - g_rd; return d > 0 ? (size_t)d : 0; }
 int EarsBankMs(const char *key) { return Voice_Ms(key); }
 bool EarsBankPlay(const char *key) { return g_spawned && g_spk.registered && Voice_Play(key, SPEAKER_OBJ); }
+void EarsSpeakerFlush() { g_flush = true; }
+void EarsBankStop() { Voice_Stop(); }
+void SendHush(const char *by);                                // (the relay)
+void EarsHush(const char *by) { SendHush(by); }
 
 void StartEars() {
     EarsHost h = {};
@@ -3237,6 +3277,9 @@ void StartEars() {
     h.speaker_pending = EarsSpeakerPending;
     h.bank_ms = EarsBankMs;
     h.bank_play = EarsBankPlay;
+    h.speaker_flush = EarsSpeakerFlush;
+    h.bank_stop = EarsBankStop;
+    h.hush = EarsHush;
     Ears_Start(h, g_brain_url, g_mic);
 }
 

@@ -25,6 +25,10 @@ struct EarsHost {
     size_t (*speaker_pending)();                // samples still queued in her speaker
     int (*bank_ms)(const char *key);            // her bank line's length in ms, -1: no bank has it
     bool (*bank_play)(const char *key);         // plays her bank line at her, waits for its end
+    // someone talked over her (barge-in): cut her short
+    void (*speaker_flush)();                    // drops what's queued in her speaker
+    void (*bank_stop)();                        // fades out the bank line playing now (bank_play returns)
+    void (*hush)(const char *by);               // the other games stop her too (the relay)
 };
 
 // Starts the threads. brain_url: wss://.../edith/brain. mic: "default" (the default recording device)
@@ -40,8 +44,11 @@ void Ears_Voip(const char *name, uint32_t rate, const int16_t *pcm, size_t n);
 // The host's line on another game: played here like her own reply (pack, else streamed from the brain).
 void Ears_PlayLine(const char *line_json);
 
-// Her line is playing (the mic is deaf meanwhile).
+// Her line is playing.
 bool Ears_Speaking();
+
+// Someone talked over her on another game (the relay's hush): she stops here too.
+void Ears_Hush(const char *by);
 
 // The brain link is up.
 bool Ears_Up();

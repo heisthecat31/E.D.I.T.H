@@ -40,6 +40,12 @@ constexpr const char *BUILD = "ears-dll-1";
 constexpr uint32_t RATE = 24000;                    // her voice: int16 mono 24 kHz
 constexpr float SPEECH_LEVEL = 2.5f;                // speech = this many times the noise floor
 constexpr int SILENCE_MS = 500, MAX_UTTERANCE_S = 12;
+// Talking over her cuts her off (user, 2026-10-19). While she speaks, speech only counts once it has
+// been clearly above the noise for BARGE_MS (her own voice leaking into a mic raises that mic's noise
+// floor, and a cough or a bump is shorter); shorter bits on your mic are dropped as before.
+constexpr int BARGE_MS = 400;
+constexpr float BARGE_LEVEL = 1.4f;                 // x the speech threshold, while she speaks
+constexpr DWORD BARGE_SETTLE_MS = 500;              // her line's first moments: a mic only hears her start
 
 #define ELOG(...) do { if (H.log) H.log(__VA_ARGS__); } while (0)
 
@@ -156,6 +162,27 @@ std::condition_variable g_vcv;
 std::deque<J> g_replies;                            // her lines to play
 std::deque<bool> g_shared;                          // (each: the host's line, already shared: don't pass it on)
 std::atomic<bool> g_speaking{ false };
+std::atomic<bool> g_cut{ false };                   // someone talked over her: this line stops
+std::atomic<ULONGLONG> g_speak_since{ 0 };
+
+// Cut her short: her speaker, her bank line, the rest of what she was going to say. `by` talked
+// over her; tell: this game says so (to the other games, and its brain when it's the host's).
+void Interrupt(const std::string &by, bool tell) {
+    if (!g_speaking || g_cut) return;
+    g_cut = true;
+    {
+        std::lock_guard<std::mutex> lk(g_vmx);
+        g_replies.clear();
+        g_shared.clear();
+    }
+    if (H.bank_stop) H.bank_stop();
+    if (H.speaker_flush) H.speaker_flush();
+    ELOG("ears: %s talked over her: she stops", by.empty() ? "you" : by.c_str());
+    if (!tell) return;
+    std::string who = by.empty() ? std::string(H.me ? H.me() : "") : by;
+    if (H.hush) H.hush(who.c_str());
+    if (!H.puppet()) SendJson("{\"t\":\"dll\",\"line\":\"" + Esc("event interrupted by=" + who) + "\"}");
+}
 
 void Reply(const J &m) {
     // face and orders first (as edith_ears.py apply()), then her line
@@ -407,9 +434,10 @@ bool Push(const char *data, size_t bytes) {
     const int16_t *pcm = (const int16_t *)data;
     size_t n = bytes / 2, done = 0;
     int stuck = 0;
-    while (done < n) {
+    while (done < n && !g_cut) {
         size_t step = n - done < 4800 ? n - done : 4800;          // 0.2 s at a time
         if (H.speaker_push(pcm + done, step)) { done += step; stuck = 0; continue; }
+        if (g_cut) return false;                               // talked over: the rest is dropped
         if (++stuck > 300) return false;                       // 6 s: her speaker isn't playing
         Sleep(20);
     }
@@ -449,6 +477,8 @@ void VoiceThread() {
             if (it.file) keys += (keys.empty() ? "" : " ") + it.key;
         }
         ELOG("ears: '%s' <- %s", m.str("say").c_str(), how.c_str());
+        g_cut = false;
+        g_speak_since = GetTickCount64();
         g_speaking = true;
         SendJson("{\"t\":\"speaking\",\"on\":true}");
         if (!shared) {                                         // the other games play it too
@@ -469,7 +499,7 @@ void VoiceThread() {
         }
         bool ok = true;
         for (auto &it : items) {
-            if (!ok) break;
+            if (!ok || g_cut) break;
             if (it.file) {
                 if (!it.path_or_text.compare(0, 5, "bank:")) {     // her bank: the game's sound engine plays it
                     for (int k = 0; k < 600 && H.speaker_pending() > 0; ++k) Sleep(20);   // after what's streaming
@@ -505,7 +535,7 @@ void VoiceThread() {
                     piece = g_renders[id].front();
                     g_renders[id].pop_front();
                 }
-                if (piece.empty()) break;
+                if (piece.empty() || g_cut) break;
                 if (piece.size() == 1 && piece[0] == '') { complete = true; break; }
                 all += piece;
                 if (!(ok = Push(piece.data(), piece.size()))) break;
@@ -516,9 +546,9 @@ void VoiceThread() {
             }
             Keep(it.key, all, complete);
         }
-        if (!ok) ELOG("ears: her speaker isn't playing: line dropped");
-        for (int k = 0; k < 600 && H.speaker_pending() > 0; ++k) Sleep(20);   // let it play out (12 s at most)
-        Sleep(400);                                            // her tail in the room
+        if (!ok && !g_cut) ELOG("ears: her speaker isn't playing: line dropped");
+        for (int k = 0; k < 600 && H.speaker_pending() > 0 && !g_cut; ++k) Sleep(20);   // let it play out (12 s at most)
+        Sleep(g_cut ? 100 : 400);                              // her tail in the room
         g_speaking = false;
         SendJson("{\"t\":\"speaking\",\"on\":false}");
     }
@@ -533,6 +563,8 @@ struct Vad {
     std::deque<std::vector<int16_t>> pre;                      // 0.3 s before speech starts
     std::vector<int16_t> rest;                                 // a frame's start, waiting for the rest
     ULONGLONG last = 0;
+    bool over = false;                                         // this speech began while she spoke
+    int loud = 0;                                              // ...and has been loud this many frames
 };
 
 void Upload(const std::string &who, const std::vector<int16_t> &pcm) {
@@ -544,8 +576,10 @@ void Upload(const std::string &who, const std::vector<int16_t> &pcm) {
     Send(true, std::move(m));
 }
 
-// 16 kHz samples in; whole utterances out to the brain as `who` ("" = this PC's mic).
-void Feed(Vad &v, const std::string &who, const int16_t *x, size_t n) {
+// 16 kHz samples in; whole utterances out to the brain as `who` ("" = this PC's mic). While she speaks
+// (her = true) speech that stays clearly loud for BARGE_MS cuts her off; drop_short: other speech
+// meanwhile isn't sent (your mic: it may only be her own voice coming back).
+void Feed(Vad &v, const std::string &who, const int16_t *x, size_t n, bool her = false, bool drop_short = false) {
     v.rest.insert(v.rest.end(), x, x + n);
     size_t k = 0;
     for (; k + 480 <= v.rest.size(); k += 480) {
@@ -558,6 +592,8 @@ void Feed(Vad &v, const std::string &who, const int16_t *x, size_t n) {
             if (lvl > v.noise * SPEECH_LEVEL && lvl > 150) {
                 v.speech = true;
                 v.quiet = 0;
+                v.over = her;
+                v.loud = 0;
                 v.buf.clear();
                 for (auto &p : v.pre) v.buf.insert(v.buf.end(), p.begin(), p.end());
                 v.buf.insert(v.buf.end(), f, f + 480);
@@ -568,9 +604,17 @@ void Feed(Vad &v, const std::string &who, const int16_t *x, size_t n) {
         } else {
             v.buf.insert(v.buf.end(), f, f + 480);
             v.quiet = lvl < v.noise * SPEECH_LEVEL * 0.6f ? v.quiet + 1 : 0;
+            if (v.over && her && g_speaking && !g_cut && GetTickCount64() - g_speak_since > BARGE_SETTLE_MS) {
+                v.loud = lvl > v.noise * SPEECH_LEVEL * BARGE_LEVEL ? v.loud + 1 : v.loud > 0 ? v.loud - 1 : 0;
+                if (v.loud * 30 >= BARGE_MS) {
+                    ELOG("ears: barge-in by %s (level %.0f, noise %.0f)", who.empty() ? "your mic" : who.c_str(), lvl, v.noise);
+                    Interrupt(who, true);
+                    v.over = false;                            // (an utterance like any other from here)
+                }
+            }
             if (v.quiet * 30 > SILENCE_MS || v.buf.size() / 480 * 0.03 > MAX_UTTERANCE_S) {
                 v.speech = false;
-                if (v.buf.size() > 480 * 10) {                 // > 0.3 s
+                if (v.buf.size() > 480 * 10 && !(drop_short && v.over)) {   // > 0.3 s (not her echo)
                     Upload(who, v.buf);
                     ELOG("ears: %s %.1f s sent", who.empty() ? "mic" : who.c_str(), v.buf.size() / 16000.0);
                 }
@@ -650,8 +694,8 @@ void MicThread() {
                     cap->ReleaseBuffer(frames);
                     bool muted = H.muted();
                     if (muted != was_muted) { ELOG(muted ? "ears: muted on voice chat: mic not sent" : "ears: mic on"); was_muted = muted; }
-                    if (g_speaking || muted || !H.in_lobby() || !g_up) Reset(v);
-                    else Feed(v, "", out.data(), out.size());
+                    if (muted || !H.in_lobby() || !g_up) Reset(v);
+                    else Feed(v, "", out.data(), out.size(), g_speaking, true);
                     if (FAILED(cap->GetNextPacketSize(&pk))) { lost = true; break; }
                 }
                 if (lost) break;
@@ -696,7 +740,7 @@ void VoipThread() {
                 acc += s; ++cnt; pos += 1.0;
                 if (pos >= step) { pos -= step; y.push_back((int16_t)(acc / cnt)); acc = 0; cnt = 0; }
             }
-            Feed(v, c.name, y.data(), y.size());
+            Feed(v, c.name, y.data(), y.size(), g_speaking);
         }
         for (auto &x : st)                                     // a voice that stopped sending: its speech ends
             if (x.second.speech && now - x.second.last > (ULONGLONG)SILENCE_MS) {
@@ -742,4 +786,5 @@ void Ears_PlayLine(const char *line_json) {
 }
 
 bool Ears_Speaking() { return g_speaking; }
+void Ears_Hush(const char *by) { Interrupt(by ? by : "", false); }
 bool Ears_Up() { return g_up; }

@@ -17,3 +17,6 @@ int Voice_Ms(const char *key);
 // Plays the line on game object `obj` and waits for it to end (then unloads its bank). false: no
 // bank for it, or the sound engine refused it (logged).
 bool Voice_Play(const char *key, uint64_t obj);
+
+// Cuts the line playing now short (a quick fade; Voice_Play then returns early). Someone talked over her.
+void Voice_Stop();
