@@ -373,6 +373,11 @@ std::vector<Item> Plan(const J &m) {
     std::string say = m.str("say"), key = m.str("key"), alt = m.str("alt"), path;
     long long b;
     std::vector<Item> out;
+    const J *st = m.get("stream");
+    if (st && st->t == J::BOOL && st->b) {                          // re-voiced on the server: never
+        out.push_back({ false, say, "" });                          // the bank's or a kept copy (no key:
+        return out;                                                 // not kept either)
+    }
     if (Mine(say, key, alt, path)) return { { true, path, key } };
     std::vector<std::vector<std::string>> parts;
     const J *ps = m.get("parts");
@@ -456,7 +461,10 @@ void VoiceThread() {
                     if (p.t != J::ARR || p.a.size() < 3) continue;
                     line += std::string(i ? "," : "") + "[\"" + Esc(p.a[0].s) + "\",\"" + Esc(p.a[1].s) + "\",\"" + Esc(p.a[2].s) + "\"]";
                 }
-            line += "]}";
+            line += "]";
+            const J *st = m.get("stream");
+            if (st && st->t == J::BOOL && st->b) line += ",\"stream\":true";
+            line += "}";
             H.voice_line(keys.c_str(), line.c_str());
         }
         bool ok = true;

@@ -115,6 +115,8 @@ constexpr uint64_t SYM_NET_PHYSICS = 0x8fee6557f995e4a3ull;
 
 constexpr float FOLLOW_DIST = 1.5f;      // m from the player she hovers at
 constexpr float FOLLOW_ABOVE = 0.35f;    // m above the player's root
+constexpr float CROWD_RADIUS = 4.0f;     // m: players this close to each other are one group
+constexpr float CROWD_ABOVE = 0.9f;      // m above the group's heads she hovers
 constexpr float GAIN = 1.2f;             // (m/s) per m of distance to her spot
 constexpr float MAX_SPEED = 3.0f;        // m/s
 constexpr DWORD TICK_MS = 33;
@@ -213,12 +215,46 @@ constexpr uintptr_t GAME_LOG_RVA = 0xEBE70;
 const uint8_t GAME_LOG_BYTES[] = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x6C, 0x24, 0x20, 0x56, 0x57 };
 typedef void (*game_log_fn)(int level, uint64_t unk, const char *fmt, va_list a);
 game_log_fn GameLogFn = nullptr;
+
+// --- barriers she flies through ------------------------------------------------------------------
+// The lobby's barriers (mpl_lobby_b_barrier_combat_entrance / combat_tri / arena_tri / punch_blocker,
+// the prop-collision walls mpl_lobby_b(_pink)_barrier_prop_collision_tri at (+-9, 7, -5.2)) stop props
+// but not players, so they stopped her (user: "all but 1 of these barriers need removing for her
+// only"). When something hits one, the lobby's script (3cf0eb2d98e15d70.dll, prop_barrier_impact)
+// debug-prints "Barrier_Impact_detected" through the game's log write (NWriteLog, the va_list one
+// at GAME_LOG_RVA, hooked here). That print, then her hitting something by herself = she ran into a
+// barrier: she hops through it. Not the social barrier (mpl_lobby_b_barrier_social_pf's actors at
+// (0, 1.76, -25.82) and (0, 1.47, -28.02)): the staging area stays closed to her (user 2026-10-19).
+constexpr DWORD BARRIER_WINDOW_MS = 400;  // the print this recently, then her hit = a barrier
+constexpr float BARRIER_HOP = 1.6f;      // m she jumps ahead through it
+const float SOCIAL_BARRIER[3] = { 0.0f, 1.6f, -26.9f };
+constexpr float SOCIAL_RADIUS = 6.0f;    // m: a barrier hit this close to it is the social barrier
+volatile ULONGLONG g_barrier_at = 0;
+ULONGLONG g_hopped_until = 0;                                 // a hop isn't a hit (her jump read as speed)
+constexpr DWORD HOP_QUIET_MS = 400;
+game_log_fn Real_GameLogV = nullptr;
+
+bool BarrierPrint(const char *fmt, va_list a) {
+    __try {
+        if (!fmt || fmt[0] != '[' || strncmp(fmt, "[DEBUGPRINT] %s", 15)) return false;
+        va_list c = a;
+        const char *text = va_arg(c, const char *);
+        return text && !strcmp(text, "Barrier_Impact_detected");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void Hooked_GameLogV(int level, uint64_t unk, const char *fmt, va_list a) {
+    if (BarrierPrint(fmt, a)) g_barrier_at = GetTickCount64();
+    Real_GameLogV(level, unk, fmt, a);
+}
 volatile bool g_game_log_on = false;
 
 void GameLog(const char *fmt, ...) {
     va_list a;
     va_start(a, fmt);
-    GameLogFn(2, 0, fmt, a);                                // 2 = info
+    (Real_GameLogV ? Real_GameLogV : GameLogFn)(2, 0, fmt, a);   // 2 = info
     va_end(a);
 }
 
@@ -554,6 +590,54 @@ bool PlayerAt(int s, float *pos, float *vel) {
     return fabsf(pos[0]) + fabsf(pos[1]) + fabsf(pos[2]) > 1e-4f;
 }
 
+// "name:x,y,z;name:x,y,z" for every player whose head is known (the state line's players=).
+void PlayersLine(char *out, size_t size) {
+    size_t len = 0;
+    out[0] = 0;
+    for (int i = 0; i < g_nnames && len + 80 < size; ++i) {
+        float p[3], v[3];
+        if (!PlayerAt(g_names[i].slot, p, v)) continue;
+        int n = snprintf(out + len, size - len, "%s%s:%.2f,%.2f,%.2f", len ? ";" : "", g_names[i].name, p[0], p[1], p[2]);
+        if (n > 0) len += (size_t)n;
+    }
+}
+
+// The crowd: the player with the most others within CROWD_RADIUS, and the middle of that group
+// (false: nobody's here). n: how many are in it.
+bool CrowdCentre(float *out, int *n = nullptr) {
+    float heads[32][3];
+    int m = 0;
+    for (int i = 0; i < g_nnames && m < 32; ++i) {
+        float v[3];
+        if (PlayerAt(g_names[i].slot, heads[m], v)) ++m;
+    }
+    if (!m) return false;
+    int best = -1, most = 0;
+    for (int i = 0; i < m; ++i) {
+        int c = 0;
+        for (int j = 0; j < m; ++j) {
+            float dx = heads[i][0] - heads[j][0], dy = heads[i][1] - heads[j][1], dz = heads[i][2] - heads[j][2];
+            if (dx * dx + dy * dy + dz * dz < CROWD_RADIUS * CROWD_RADIUS) ++c;
+        }
+        if (c > most) { most = c; best = i; }
+    }
+    float sum[3] = { 0, 0, 0 };
+    int c = 0;
+    for (int j = 0; j < m; ++j) {
+        float dx = heads[best][0] - heads[j][0], dy = heads[best][1] - heads[j][1], dz = heads[best][2] - heads[j][2];
+        if (dx * dx + dy * dy + dz * dz >= CROWD_RADIUS * CROWD_RADIUS) continue;
+        for (int k = 0; k < 3; ++k) sum[k] += heads[j][k];
+        ++c;
+    }
+    for (int k = 0; k < 3; ++k) out[k] = sum[k] / c;
+    if (n) *n = c;
+    return true;
+}
+
+bool RoamSpot(const float *her, float *spot);                 // her 2018 path (below)
+int g_roam_at = -1;                                           // the node she's flying to (-1: not roaming)
+ULONGLONG g_roam_wait = 0;
+
 // --- vectors / quaternions (x y z w) ---------------------------------------------------------
 void Cross(const float *a, const float *b, float *o) {
     o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0];
@@ -713,6 +797,79 @@ void SetSnowVelocity(unsigned k, const float *v) {
 
 void SendSnow(unsigned k, const float *at, const float *v);   // (the relay, below)
 
+// --- her balls on the network: whoever holds one tells the others --------------------------------
+// Each game has its own ball actors and the server doesn't know them (they're off the net in public
+// lobbies), so a grab only moved the holder's copy (user: "if someone grabs one of those balls its
+// visible for the others too"). The game whose player holds ball k sends {"t":"ball","k","pos","vel",
+// "held":1} BALL_SEND_MS apart and "held":0 with the release velocity when they let go; the others
+// put their copy there (a teleport plus that velocity), and a let-go ball flies on from there the
+// same everywhere, then goes back to the pile.
+constexpr DWORD BALL_SEND_MS = 66;       // 15 a second while held
+constexpr DWORD BALL_REMOTE_MS = 600;    // someone else's hold counts this long after their last message
+struct BallNet { bool held = false; float pp[3] = {}; LONGLONG pqpc = 0; ULONGLONG last_send = 0, remote_until = 0; } g_ball[16];
+void SendBall(unsigned k, const float *at, const float *v, bool held);   // (the relay, below)
+void LaunchSnow(unsigned k, const float *at, const float *v);
+
+bool BallHeld(unsigned k) {
+    if (!g_her.touch) return false;
+    uint32_t h = Instance(g_her.touch, SnowActor(k), SYM_TOUCH);
+    if (h == 0xffffffffu) h = AnyInstance(g_her.touch, SnowActor(k));
+    if (h == 0xffffffffu) return false;
+    uint16_t slot = *(uint16_t *)(*(uint8_t **)(g_her.touch + 0xc8) + (size_t)(h & 0xffff) * 4);
+    const uint8_t *rec = *(uint8_t **)(g_her.touch + 0xf8) + (size_t)slot * TOUCH_STRIDE;
+    return *(const uint32_t *)(rec + TOUCH_GRABS) || *(const uint32_t *)(rec + TOUCH_GRABS + 4);
+}
+
+bool BallAt(unsigned k, float *p) {
+    uint32_t h = Instance(g_her.transforms, SnowActor(k), NCA_TRANSFORM);
+    if (h == 0xffffffffu) return false;
+    Pose x;
+    Real_TransformGet(g_her.transforms, &x, h);
+    memcpy(p, x.p, 12);
+    return true;
+}
+
+// Every tick, on every game: your hand on a ball goes out to the others.
+void UpdateBalls() {
+    if (!g_snow_count || !HerAlive()) return;
+    ULONGLONG now = GetTickCount64();
+    LARGE_INTEGER qpc, freq;
+    QueryPerformanceCounter(&qpc);
+    QueryPerformanceFrequency(&freq);
+    for (unsigned k = 0; k < g_snow_count && k < 16; ++k) {
+        BallNet &n = g_ball[k];
+        float p[3];
+        if (!BallAt(k, p)) continue;
+        float dt = n.pqpc ? (float)(qpc.QuadPart - n.pqpc) / (float)freq.QuadPart : 0.0f;
+        float v[3] = { 0, 0, 0 };
+        if (dt > 0.005f && dt < 0.2f)
+            for (int i = 0; i < 3; ++i) v[i] = (p[i] - n.pp[i]) / dt;
+        memcpy(n.pp, p, 12);
+        n.pqpc = qpc.QuadPart;
+        bool held = BallHeld(k) && now >= n.remote_until;    // (a ball someone else holds isn't yours)
+        if (held) {
+            g_snow[k].thrown = now;                           // (not back to the pile while it's in a hand)
+            g_snow[k].launch = 0;
+            if (!n.held) Log("ball %u: you grabbed it", k);
+            if (now - n.last_send >= BALL_SEND_MS) { n.last_send = now; SendBall(k, p, v, true); }
+        } else if (n.held) {
+            Log("ball %u: you let go (%.2f m/s)", k, Len(v));
+            g_snow[k].thrown = now;                           // back to the pile in a while, like her throws
+            SendBall(k, p, v, false);
+        }
+        n.held = held;
+    }
+}
+
+// Another game's player holds (held) or let go of ball k: this copy goes there.
+void TakeBall(unsigned k, const float *at, const float *v, bool held) {
+    if (k >= g_snow_count || k >= 16 || !HerAlive()) return;
+    BallNet &n = g_ball[k];
+    n.remote_until = held ? GetTickCount64() + BALL_REMOTE_MS : 0;
+    n.held = false;
+    LaunchSnow(k, at, v);                                     // teleport, then that velocity
+}
+
 // Throw at player slot `s`, leading their head by its velocity over the flight time.
 bool ThrowSnowball(const Pose &me, int s) {
     float tp[3], tv[3];
@@ -757,13 +914,16 @@ void LaunchSnow(unsigned k, const float *at, const float *v) {
 // her and a state line every 2 s, for the companion's memory). Polled on the game thread in Tick.
 //   follow [name] | come [name] | stay | look | home | goto x y z | spin [keep] | flip front|back|left|right [n|keep]
 //   | stop | throw [to=name] | push [m/s] [to=name] | shutdown [to=name] | favour [name] | heard <text> | status
+//   | roam (free roam on her 2018 Christmas path) | approach <name> (fly up to them, then hover by them)
+//   | follow crowd (hover over the biggest group of players)
 // Events carry by=<name> (who did it); "heard <name> <text>" is another player talking to her.
 // A spin turns her about world up; a flip about her own side axis (front / back) or her front
 // axis (left / right roll). "keep" goes on until "stop" (or another order), with a dizzy event
 // every DIZZY_MS; after a long one she wobbles a while.
-enum Order { O_FOLLOW, O_COME, O_STAY, O_GOTO, O_SPIN };
+enum Order { O_FOLLOW, O_COME, O_STAY, O_GOTO, O_SPIN, O_ROAM, O_CROWD, O_APPROACH };
 const char *OrderName(Order o) {
-    return o == O_FOLLOW ? "follow" : o == O_COME ? "come" : o == O_STAY ? "stay" : o == O_GOTO ? "goto" : "spin";
+    return o == O_FOLLOW ? "follow" : o == O_COME ? "come" : o == O_STAY ? "stay" : o == O_GOTO ? "goto"
+         : o == O_ROAM ? "roam" : o == O_CROWD ? "crowd" : o == O_APPROACH ? "approach" : "spin";
 }
 struct Orders {
     Order order = O_FOLLOW, after = O_FOLLOW; float target[3] = {}; ULONGLONG until = 0; bool throw_now = false;
@@ -778,11 +938,12 @@ struct Orders {
     char push_to[64] = "", kill_to[64] = "", throw_to[64] = "";   // push / shutdown / throw aimed at ("" = her player)
 } g_orders;
 int TargetSlot() {
-    bool to_player = g_orders.order == O_FOLLOW || g_orders.order == O_COME;
+    bool to_player = g_orders.order == O_FOLLOW || g_orders.order == O_COME || g_orders.order == O_APPROACH;
     return SlotOf(to_player && g_orders.who[0] ? g_orders.who : g_favour);
 }
 constexpr u_short CMD_PORT = 47321, EVENT_PORT = 47322;
 constexpr float COME_DIST = 0.7f;        // m: "come here" hovers this close
+constexpr float APPROACH_DIST = 1.1f;    // m: "approach <name>" stops this far from their head
 constexpr float SPIN_RATE = 6.0f;        // rad/s about up
 constexpr DWORD SPIN_MS = 2000;
 constexpr float FLIP_RATE = 7.0f;        // rad/s: a flip takes ~0.9 s
@@ -796,7 +957,7 @@ sockaddr_in g_ai = {};
 bool g_ears_dll = false;                                      // EDITH.ini ears=dll: her ears are built in (edith_ears.cpp)
 
 void Event(const char *fmt, ...) {
-    char buf[512];
+    char buf[1536];
     va_list a;
     va_start(a, fmt);
     int n = vsnprintf(buf, sizeof buf, fmt, a);
@@ -868,7 +1029,18 @@ void PollOrders(const Pose &me) {
             strcpy_s(g_favour, name);
             continue;
         }
-        if (!strncmp(buf, "follow", 6) || !strncmp(buf, "come", 4)) {   // "follow [name]" / "come [name]"
+        if (!strncmp(buf, "follow crowd", 12) || !strncmp(buf, "crowd", 5)) {
+            g_orders.order = O_CROWD;
+            g_orders.who[0] = 0;
+        }
+        else if (!strncmp(buf, "roam", 4)) { g_orders.order = O_ROAM; g_roam_at = -1; g_roam_wait = 0; }
+        else if (!strncmp(buf, "approach ", 9)) {             // "approach <name>": fly up to them
+            g_orders.who[0] = 0;
+            sscanf_s(buf + 9, "%63s", g_orders.who, (unsigned)sizeof g_orders.who);
+            if (SlotOf(g_orders.who) < 0) { Event("error no player %s", g_orders.who); g_orders.who[0] = 0; continue; }
+            g_orders.order = O_APPROACH;
+        }
+        else if (!strncmp(buf, "follow", 6) || !strncmp(buf, "come", 4)) {   // "follow [name]" / "come [name]"
             g_orders.order = buf[0] == 'f' ? O_FOLLOW : O_COME;
             g_orders.who[0] = 0;
             const char *rest = buf + (buf[0] == 'f' ? 6 : 4);
@@ -933,6 +1105,81 @@ void PollOrders(const Pose &me) {
         Log("order \"%s\" (%s -> %s)", buf, OrderName(was), OrderName(g_orders.order));
         Event("ok %s", buf);
     }
+}
+
+// --- free roam: her 2018 Christmas lobby path -------------------------------------------------
+// The 40 prp_itt_cube_sat_mp_home_position_pathfinder actors of mpl_lobby_b2_xmas (2018): their
+// positions from that level's actor data (CActorDataResourceWin7, all unparented), their links from
+// each one's script data (CScriptCRWin7: a next node, and at 18 and 31 a second one). Node 0 is her
+// 2018 home. A loop: 0 -> 1 ... 18 -> 19 | 23 ... 31 -> 32 | 2 ... 39 -> 2.
+struct RoamNode { float p[3]; int next[2]; };
+const RoamNode ROAM_PATH[] = {
+    { { 0.000f, 1.073f, -0.000f }, { 1, -1 } },   //  0 5496188c1420bd04
+    { { 0.057f, 2.135f, -0.505f }, { 2, -1 } },   //  1 cb9a31dd14888748
+    { { 4.820f, 1.144f, 1.552f }, { 3, -1 } },   //  2 3d6ea5cbc17bcf6c
+    { { 5.824f, 0.183f, -0.789f }, { 4, -1 } },   //  3 25a70b36f793d284
+    { { 6.858f, -1.122f, -2.667f }, { 5, -1 } },   //  4 b557ae6bdb1cf3fc
+    { { 7.554f, 0.728f, 0.380f }, { 6, -1 } },   //  5 d119b5f40a2c75f0
+    { { 6.114f, 0.374f, -2.750f }, { 7, -1 } },   //  6 a3d7b2cce8e5af9c
+    { { 1.518f, 1.684f, -5.408f }, { 8, -1 } },   //  7 40201fb3b10b3490
+    { { 2.306f, 2.337f, -8.598f }, { 9, -1 } },   //  8 5a445e586c9f2a20
+    { { -0.989f, 1.387f, -10.680f }, { 10, -1 } },   //  9 fd3139a5b3f38ae2
+    { { -0.644f, 1.768f, -14.959f }, { 11, -1 } },   // 10 997f223a62c30cee
+    { { 1.436f, 0.997f, -17.474f }, { 12, -1 } },   // 11 831b63d1bf57125e
+    { { 0.235f, 2.358f, -20.457f }, { 14, -1 } },   // 12 e2785a9986983672 (13 is in the staging area: not for her)
+    { { 0.342f, 2.267f, -26.390f }, { 14, -1 } },   // 13 d3b211bf3de978c6
+    { { -0.908f, 0.414f, -15.924f }, { 15, -1 } },   // 14 25fab36e26a1029e
+    { { -5.083f, 0.323f, -12.575f }, { 16, -1 } },   // 15 7daab0e56df3a8e8
+    { { -7.102f, 2.881f, -8.541f }, { 17, -1 } },   // 16 ffda3c7ce4c750b2
+    { { -8.944f, 0.987f, 2.460f }, { 18, -1 } },   // 17 bf79afc8f29d60f0
+    { { -9.783f, 0.722f, 4.959f }, { 19, 23 } },   // 18 fa2e20749a49d9a8
+    { { -20.039f, 1.317f, 13.754f }, { 20, -1 } },   // 19 d317fb6d7c300d28
+    { { -24.333f, 1.164f, 10.725f }, { 21, -1 } },   // 20 cb83edc89beac0da
+    { { -25.964f, 2.010f, 15.584f }, { 22, -1 } },   // 21 516777f4f504f572
+    { { -11.806f, 0.323f, 6.612f }, { 23, -1 } },   // 22 5100f16e4fd6a2b4
+    { { -8.724f, 0.205f, 6.491f }, { 24, -1 } },   // 23 4d0bb82a78e2be9c
+    { { -10.040f, 1.502f, 3.936f }, { 25, -1 } },   // 24 41dc1d3b8a0a5bb6
+    { { -9.104f, 0.577f, 3.248f }, { 26, -1 } },   // 25 8f8af379245e96d6
+    { { -6.613f, 1.131f, 5.171f }, { 27, -1 } },   // 26 1357d9d2c9e1712e
+    { { -6.972f, -0.967f, 4.181f }, { 28, -1 } },   // 27 e1ad9a5534828a82
+    { { -4.959f, 0.528f, 3.189f }, { 29, -1 } },   // 28 1dacd0282e92254a
+    { { -4.584f, -0.363f, 6.026f }, { 30, -1 } },   // 29 3f7f5583703e8e3c
+    { { -1.533f, 0.342f, 4.613f }, { 31, -1 } },   // 30 498d3bde276e28d4
+    { { 6.319f, 0.521f, 4.896f }, { 32, 2 } },   // 31 d68461ffb86cd3f4
+    { { 12.963f, 0.892f, 7.547f }, { 33, -1 } },   // 32 13f31012b4ede49a
+    { { 18.586f, -0.333f, 17.818f }, { 34, -1 } },   // 33 89700cb460d186f4
+    { { 18.815f, 1.277f, 17.308f }, { 35, -1 } },   // 34 b8ddc10861729f86
+    { { 15.695f, 2.411f, 13.190f }, { 36, -1 } },   // 35 0b6706b753372968
+    { { 15.831f, 0.922f, 10.626f }, { 37, -1 } },   // 36 a049d7ad86a85274
+    { { 18.048f, 0.292f, 8.927f }, { 38, -1 } },   // 37 3acacb0b5294301a
+    { { 16.468f, 0.564f, 5.644f }, { 39, -1 } },   // 38 91e41a11870b4b06
+    { { 12.596f, 0.888f, 7.627f }, { 2, -1 } },   // 39 67108e0752f80322
+};
+constexpr int ROAM_N = (int)(sizeof ROAM_PATH / sizeof ROAM_PATH[0]);
+constexpr float ROAM_REACHED = 0.6f;     // m: at a node, on to the next
+constexpr DWORD ROAM_PAUSE_MS = 2500;    // she looks around a moment at some nodes
+
+// Where roaming puts her now: the node she's flying to (the nearest one when she starts).
+bool RoamSpot(const float *her, float *spot) {
+    if (g_roam_at < 0 || g_roam_at >= ROAM_N) {
+        float best = 1e30f;
+        for (int i = 0; i < ROAM_N; ++i) {
+            const float *p = ROAM_PATH[i].p;
+            float d = (p[0] - her[0]) * (p[0] - her[0]) + (p[1] - her[1]) * (p[1] - her[1]) + (p[2] - her[2]) * (p[2] - her[2]);
+            if (d < best) { best = d; g_roam_at = i; }
+        }
+        Log("roam: from node %d", g_roam_at);
+    }
+    const RoamNode &n = ROAM_PATH[g_roam_at];
+    memcpy(spot, n.p, 12);
+    float d[3] = { n.p[0] - her[0], n.p[1] - her[1], n.p[2] - her[2] };
+    if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > ROAM_REACHED * ROAM_REACHED) return true;
+    ULONGLONG now = GetTickCount64();
+    if (!g_roam_wait) { g_roam_wait = now + (rand() % 3 == 0 ? ROAM_PAUSE_MS : 0); return true; }
+    if (now < g_roam_wait) return true;
+    g_roam_wait = 0;
+    g_roam_at = n.next[1] >= 0 && rand() % 2 ? n.next[1] : n.next[0];
+    return true;
 }
 
 void UpdateSnow() {
@@ -1189,6 +1436,7 @@ void Tick() {
     bool player = NearestPlayer(me.p, pl, &pslot);
     g_stage = 4;
     UpdateSnow();
+    UpdateBalls();
     WatchKill();
     PollOrders(me);
     if (g_orders.throw_now) {                                  // "throw one at me" (to=<name>: at them)
@@ -1216,11 +1464,13 @@ void Tick() {
     static ULONGLONG last_state = 0;
     if (now - last_state > 2000) {
         last_state = now;
+        char players[900];
+        PlayersLine(players, sizeof players);
         float hd = player ? sqrtf((pl[0] - me.p[0]) * (pl[0] - me.p[0]) + (pl[1] - me.p[1]) * (pl[1] - me.p[1])
                                   + (pl[2] - me.p[2]) * (pl[2] - me.p[2])) : -1.0f;
-        Event("state mode=%s order=%s her=%.2f,%.2f,%.2f player=%.2f,%.2f,%.2f dist=%.2f held=%d speaker=%d net=%s host=%s me=%s members=%s ai=%s",
+        Event("state mode=%s order=%s her=%.2f,%.2f,%.2f player=%.2f,%.2f,%.2f dist=%.2f held=%d speaker=%d net=%s host=%s me=%s members=%s ai=%s players=%s",
               ModeName(g_brain.mode), OrderName(g_orders.order), me.p[0], me.p[1], me.p[2], pl[0], pl[1], pl[2], hd,
-              (int)g_brain.held, g_spk.playing ? 1 : 0, g_net_role, g_net_host, g_me, g_net_members, g_net_ai);
+              (int)g_brain.held, g_spk.playing ? 1 : 0, g_net_role, g_net_host, g_me, g_net_members, g_net_ai, players);
     }
     static ULONGLONG last_test = 0;                           // (EDITH.ini snow_test=1: a throw every 8 s)
     if (g_snow_test && player && now - last_test > 8000) { last_test = now; ThrowSnowball(me, pslot); }
@@ -1247,7 +1497,9 @@ void Tick() {
     g_brain.held = held;
 
     // pushed? (her velocity isn't what she set; while tumbling, it keeps changing under a hand)
-    if (g_brain.have && !held) {
+    if (now < g_hopped_until) {                               // just hopped through a barrier
+        g_brain.prev[0] = v[0]; g_brain.prev[1] = v[1]; g_brain.prev[2] = v[2];
+    } else if (g_brain.have && !held) {
         float off[3] = { v[0] - g_brain.sent[0], v[1] - g_brain.sent[1], v[2] - g_brain.sent[2] };
         float chg[3] = { v[0] - g_brain.prev[0], v[1] - g_brain.prev[1], v[2] - g_brain.prev[2] };
         // a player's head this far off can't have touched her: she hit a wall (or anything) herself.
@@ -1260,7 +1512,22 @@ void Tick() {
                                 + (hp[2] - me.p[2]) * (hp[2] - me.p[2])) : 1e9f;
         bool nobody = hd > REACH_DIST;
         static ULONGLONG last_ow = 0;
-        if (g_brain.mode != TUMBLE && Len(off) > THROWN_DV && nobody) {
+        float sd[3] = { me.p[0] - SOCIAL_BARRIER[0], me.p[1] - SOCIAL_BARRIER[1], me.p[2] - SOCIAL_BARRIER[2] };
+        bool barrier = now - g_barrier_at < BARRIER_WINDOW_MS;
+        bool social = Len(sd) < SOCIAL_RADIUS;
+        float aim = Len(g_brain.sent);
+        if (g_brain.mode != TUMBLE && Len(off) > THROWN_DV && nobody && barrier && !social && aim > 0.3f && WorldTeleport) {
+            float xf[8] = { me.q[0], me.q[1], me.q[2], me.q[3], 0, 0, 0, 1 };
+            for (int k = 0; k < 3; ++k) xf[4 + k] = me.p[k] + g_brain.sent[k] / aim * BARRIER_HOP;
+            WorldTeleport(g_her.space, HER_ACTOR, xf, 0);
+            Log("barrier at (%.2f %.2f %.2f): she hops through to (%.2f %.2f %.2f)", me.p[0], me.p[1], me.p[2], xf[4], xf[5], xf[6]);
+            Event("event through barrier");
+            g_barrier_at = 0;
+            g_hopped_until = now + HOP_QUIET_MS;              // (the jump isn't a velocity: no "ow")
+            memcpy(g_brain.pos, xf + 4, 12);
+            g_brain.prev[0] = g_brain.sent[0]; g_brain.prev[1] = g_brain.sent[1]; g_brain.prev[2] = g_brain.sent[2];
+        } else if (g_brain.mode != TUMBLE && Len(off) > THROWN_DV && nobody) {
+            if (barrier) Log("barrier at (%.2f %.2f %.2f)%s", me.p[0], me.p[1], me.p[2], social ? ": the social one, she stays out" : "");
             Log("hit something by herself: %.2f m/s off what she set, nearest head %.2f m", Len(off), hd);
             if (now - last_ow > 1500) { last_ow = now; Event("event hit wall"); }
             g_brain.cause = BUMP;                             // no stare, no snowball: just ow
@@ -1336,7 +1603,13 @@ void Tick() {
             }
             o = g_orders.order = g_orders.after;
         }
-        bool to_player = o == O_FOLLOW || o == O_COME;
+        bool to_player = o == O_FOLLOW || o == O_COME || o == O_APPROACH;
+        if (o == O_APPROACH && !player) {                     // they left: back to what she does alone
+            Event("event lost %s", g_orders.who);
+            o = g_orders.order = O_ROAM;
+            g_orders.who[0] = 0;
+            to_player = false;
+        }
         if (to_player && !player) {
             float zero[3] = { 0, 0, 0 };
             Thrust(v, zero, dt, out);
@@ -1349,8 +1622,14 @@ void Tick() {
             float d[3] = { me.p[0] - pl[0], 0.0f, me.p[2] - pl[2] };
             float h = sqrtf(d[0] * d[0] + d[2] * d[2]);
             if (h < 1e-3f) { d[0] = 1.0f; d[2] = 0.0f; h = 1.0f; }
-            float r = o == O_COME ? COME_DIST : FOLLOW_DIST;
+            float r = o == O_COME ? COME_DIST : o == O_APPROACH ? APPROACH_DIST : FOLLOW_DIST;
             spot[0] = pl[0] + d[0] / h * r; spot[1] = pl[1] + FOLLOW_ABOVE; spot[2] = pl[2] + d[2] / h * r;
+        } else if (o == O_CROWD) {                            // over the biggest group's heads
+            float c[3];
+            if (CrowdCentre(c)) { spot[0] = c[0]; spot[1] = c[1] + CROWD_ABOVE; spot[2] = c[2]; }
+            else memcpy(spot, me.p, 12);
+        } else if (o == O_ROAM) {
+            if (!RoamSpot(me.p, spot)) memcpy(spot, me.p, 12);
         }
         float to[3] = { spot[0] - me.p[0], spot[1] - me.p[1], spot[2] - me.p[2] };
         float dist = Len(to);
@@ -1361,6 +1640,10 @@ void Tick() {
         if (o == O_GOTO && dist < 0.2f) {                     // arrived: stay there
             g_orders.order = O_STAY;
             Event("event arrived");
+        }
+        if (o == O_APPROACH && dist < 0.35f) {                // there: she hovers by them (the brain talks)
+            g_orders.order = O_FOLLOW;
+            Event("event approached to=%s", g_orders.who);
         }
         float lp[3], lv[3];
         int ls = now < g_look_until ? SlotOf(g_look) : -1;
@@ -2018,6 +2301,13 @@ void SendSnow(unsigned k, const float *at, const float *v) {
              k, at[0], at[1], at[2], v[0], v[1], v[2]);
     EdithNet_SendText(b);
 }
+void SendBall(unsigned k, const float *at, const float *v, bool held) {   // any member, not only the host
+    if (strcmp(g_net_role, "host") && strcmp(g_net_role, "puppet")) return;
+    char b[192];
+    snprintf(b, sizeof b, "{\"t\":\"ball\",\"k\":%u,\"pos\":[%.3f,%.3f,%.3f],\"vel\":[%.3f,%.3f,%.3f],\"held\":%d}",
+             k, at[0], at[1], at[2], v[0], v[1], v[2], held ? 1 : 0);
+    EdithNet_SendText(b);
+}
 void SendFace(const char *name, float seconds) {             // her face, for puppets without a companion
     if (strcmp(g_net_role, "host")) return;
     char b[128];
@@ -2166,6 +2456,10 @@ void TakeNet() {
         } else if (t == "snow" && !host && from == g_net_host) {  // ...threw a ball
             float at[3], v[3];
             if (JVec(m.data, "pos", at) && JVec(m.data, "vel", v)) LaunchSnow((unsigned)JNum(m.data, "k", 0), at, v);
+        } else if (t == "ball" && from != g_me) {             // someone's hand on one of her balls
+            float at[3], v[3];
+            if (JVec(m.data, "pos", at) && JVec(m.data, "vel", v))
+                TakeBall((unsigned)JNum(m.data, "k", 0), at, v, JNum(m.data, "held", 0) != 0);
         } else if (t == "face" && !host && from == g_net_host) {  // ...changed face
             SetFace(JStr(m.data, "name").c_str(), JNum(m.data, "s", 0));
         } else {
@@ -2497,7 +2791,7 @@ void __fastcall Hooked_NetGameUpdate(uint8_t *ng) {
             g_brain.have = false;
         }
         if (g_authority || g_local) {                         // steering: where her physics is decided
-            if (puppet) { PuppetTick(); UpdateSnow(); }       // (thrown balls the host relayed)
+            if (puppet) { PuppetTick(); UpdateSnow(); UpdateBalls(); }   // (thrown balls the host relayed)
             else if (host && g_holder[0] && HolderActive(now) && g_hold_rx.from == g_holder) {
                 Pose me;                                      // someone else's hand moves her: follow it
                 Real_TransformGet(g_her.transforms, &me, g_her.xf);
@@ -3038,6 +3332,10 @@ DWORD WINAPI Install(LPVOID) {
     bool speaker = SpeakerInstall(base);
     if (speaker) DetourAttach(&(PVOID &)Real_RenderAudio, Hooked_RenderAudio);
     if (VoipInstall(base)) DetourAttach(&(PVOID &)Real_Register, Hooked_Register);
+    if (GameLogFn) {                                          // (barriers she flies through)
+        Real_GameLogV = GameLogFn;
+        DetourAttach(&(PVOID &)Real_GameLogV, Hooked_GameLogV);
+    }
     LONG rc = DetourTransactionCommit();
     if (g_authority || g_local) OpenOrders();
     OpenSelf();
