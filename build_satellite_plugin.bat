@@ -4,8 +4,9 @@ rem Builds out\plugin\EDITH.dll: the satellite's behaviour (agent.md S19), her v
 rem lobby data in one DLL that runs under nEVR (NvrPluginInitEx) and under the dbgcore plugin loader
 rem (DllMain) alike (docs/nevr_plan.md). out\edith_voice.bin comes from build_voice_banks.bat.
 rem The nEVR ABI header is EchoCombat's nevr-pack worktree's; logdir.h is EchoCombat main's.
-set "EC=J:\EchoVR-Tools-Launcher\EchoCombat"
-set "ECN=J:\EchoVR-Tools-Launcher\EchoCombat-nevr"
+rem The EchoCombat checkouts beside this repo (override with EC= / ECN= in the environment)
+if not defined EC set "EC=%~dp0..\EchoCombat"
+if not defined ECN set "ECN=%~dp0..\EchoCombat-nevr"
 set "VARS_BAT="
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if exist "%VSWHERE%" (
