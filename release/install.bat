@@ -1,6 +1,8 @@
 @echo off
-rem E.D.I.T.H installer: finds Echo VR (Spark's settings, else asks), refuses nEVR, installs the
-rem plugin loader if there isn't one, then EDITH.dll, EDITH.ini, her map package and her voice.
+rem E.D.I.T.H installer: finds Echo VR (Spark's settings, else asks), then puts EDITH.dll into its
+rem plugins folder. EDITH.dll is all of her (voice, lobby data, settings) and runs under nEVR and under
+rem the plain plugin loader alike: with nEVR it turns on nEVR's local plugins (x-local-plugins: true in
+rem _local\config.yaml) so the launcher loads her; without nEVR it adds the plugin loader if there's none.
 setlocal EnableExtensions EnableDelayedExpansion
 rem Windows' own tools by full path: a PATH with Git's Unix tools first made "find /i" crawl the I: drive
 set "SYS=%SystemRoot%\System32"
@@ -65,52 +67,55 @@ if not errorlevel 1 (
 )
 
 rem ---- 3. nEVR? (its BugSplat64.dll replaces the stock one and is far bigger) -----------------
+set "NEVR=0"
 if exist "%GAME%\BugSplat64.dll" (
     for %%F in ("%GAME%\BugSplat64.dll") do set "BSIZE=%%~zF"
     if !BSIZE! gtr 665600 (
         set "BHASH="
         for /f "skip=1 delims=" %%H in ('%SYS%\certutil.exe -hashfile "%GAME%\BugSplat64.dll" SHA256 2^>nul') do if not defined BHASH set "BHASH=%%H"
         set "BHASH=!BHASH: =!"
-        if /i not "!BHASH!"=="%STOCK_BUGSPLAT_SHA256%" (
-            echo   nEVR is installed in this Echo VR ^(its BugSplat64.dll is !BSIZE! bytes, the original is 630,288^).
-            echo   E.D.I.T.H does not work with nEVR, so nothing was installed.
-            echo.
-            echo   Press a key to close.
-            pause >nul
-            exit /b 1
+        if /i not "!BHASH!"=="%STOCK_BUGSPLAT_SHA256%" set "NEVR=1"
+    )
+)
+if not exist "%GAME%\plugins\" mkdir "%GAME%\plugins" || goto :copyfail
+
+if "%NEVR%"=="1" (
+    rem nEVR loads only the plugins its config lists; the launcher writes that config before every
+    rem start and keeps a DLL put into plugins\ by hand only with local plugins on
+    echo   nEVR is installed: E.D.I.T.H runs as an nEVR plugin.
+    for %%R in ("%GAME%\..\..") do set "ROOT=%%~fR"
+    if not exist "!ROOT!\_local\" mkdir "!ROOT!\_local"
+    set "CFG=!ROOT!\_local\config.yaml"
+    "%SYS%\findstr.exe" /r /c:"^x-local-plugins: *true" "!CFG!" >nul 2>nul
+    if errorlevel 1 (
+        if exist "!CFG!" (
+            copy /y "!CFG!" "!CFG!.edith-backup" >nul
+            ( echo x-local-plugins: true& type "!CFG!.edith-backup" ) > "!CFG!" || goto :copyfail
+        ) else (
+            ( echo x-local-plugins: true ) > "!CFG!" || goto :copyfail
         )
+        echo   Turned on nEVR's local plugins ^(x-local-plugins: true in _local\config.yaml^).
+    )
+) else (
+    rem ---- the plugin loader: bin\win10\dbgcore.dll (the game loads it itself) ------------------
+    if not exist "%GAME%\dbgcore.dll" (
+        echo   Installing the plugin loader ^(dbgcore.dll^).
+        copy /y "%FILES%\loader\dbgcore.dll" "%GAME%\dbgcore.dll" >nul || goto :copyfail
+    ) else (
+        echo   Plugin loader already there: keeping it.
     )
 )
 
-rem ---- 4. the plugin loader ---------------------------------------------------------------------
-set "LOADER_NEW=0"
-if not exist "%GAME%\plugins\" (
-    echo   No plugins folder: installing the plugin loader ^(dbgcore.dll^).
-    if exist "%GAME%\dbgcore.dll" copy /y "%GAME%\dbgcore.dll" "%GAME%\dbgcore.dll.edith-backup" >nul
-    copy /y "%FILES%\loader\dbgcore.dll" "%GAME%\dbgcore.dll" >nul || goto :copyfail
-    mkdir "%GAME%\plugins" || goto :copyfail
-    set "LOADER_NEW=1"
-) else (
-    echo   Plugin loader already there: keeping it.
-)
-
-rem ---- 5. E.D.I.T.H -------------------------------------------------------------------------------
+rem ---- 4. E.D.I.T.H -------------------------------------------------------------------------------
 set "P=%GAME%\plugins"
 copy /y "%FILES%\plugins\EDITH.dll" "%P%\EDITH.dll" >nul || goto :copyfail
-if exist "%P%\EDITH.ini" (
-    copy /y "%FILES%\plugins\EDITH.ini" "%P%\EDITH.ini.new" >nul
-    echo   Kept your EDITH.ini ^(the new default is EDITH.ini.new^).
-) else (
-    copy /y "%FILES%\plugins\EDITH.ini" "%P%\EDITH.ini" >nul || goto :copyfail
-)
-if exist "%P%\EDITH\cache" rd /s /q "%P%\EDITH\cache"
-"%SYS%\robocopy.exe" "%FILES%\plugins\EDITH" "%P%\EDITH" /e /njh /njs /ndl /nfl /nc /ns /np >nul
-if errorlevel 8 goto :copyfail
-echo   Copying her voice ^(about 200 MB^)...
-"%SYS%\robocopy.exe" "%FILES%\plugins\EdithVoice" "%P%\EdithVoice" /e /njh /njs /ndl /nfl /nc /ns /np >nul
-if errorlevel 8 goto :copyfail
+rem an older release's files: her lobby data and voice are inside EDITH.dll now, and an old
+rem plugins\EDITH\*.edith would be loaded over the built-in one
+if exist "%P%\EDITH\" rd /s /q "%P%\EDITH"
+if exist "%P%\EdithVoice\" rd /s /q "%P%\EdithVoice"
 echo.
 echo   Done. E.D.I.T.H is installed: start Echo VR and go to the lobby.
+if "%NEVR%"=="1" echo   ^(Start it from the Echo VR launcher as usual; she shows on its Mods page as a local plugin.^)
 echo.
 pause
 exit /b 0

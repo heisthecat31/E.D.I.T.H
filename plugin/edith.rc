@@ -1,0 +1,5 @@
+// EDITH.dll's embedded data.
+// 101: her voice lines as Wwise banks (tools/make_voice_banks.py -> out/edith_voice.bin).
+// 102: her lobby data, the stock-based .edith (tools/make_edith_pack.py -> out/E.D.I.T.H/mpl_lobby_b2.edith).
+101 RCDATA "out\\edith_voice.bin"
+102 RCDATA "out\\E.D.I.T.H\\mpl_lobby_b2.edith"
