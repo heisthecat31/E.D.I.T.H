@@ -958,8 +958,22 @@ constexpr DWORD DIZZY_MS = 5000;         // an endless spin reports how long it 
 constexpr DWORD WOBBLE_MS = 3500;        // dizzy wobble after a long endless spin
 constexpr float PUSH_SPEED = 6.0f;       // m/s a push gives the player by default
 constexpr float PUSH_MAX = 15.0f;
-SOCKET g_sock = INVALID_SOCKET;
+SOCKET g_sock = INVALID_SOCKET;                              // her orders in (bound to CMD_PORT; the game thread reads it)
+SOCKET g_ev_sock = INVALID_SOCKET;                           // her events out to a Python companion
 sockaddr_in g_ai = {};
+
+// A UDP socket that never blocks: game, audio and hook threads use these, and a blocking recv or
+// sendto there stalls the game until its watchdog calls it a deadlock and BugSplat ends it (user,
+// 2026-10-21: the order port was busy, the events-only fallback socket was blocking and PollOrders
+// waited in recv on it, 10 s into the lobby).
+SOCKET UdpSocket() {
+    WSADATA w;
+    WSAStartup(MAKEWORD(2, 2), &w);
+    SOCKET sk = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    u_long nb = 1;
+    if (sk != INVALID_SOCKET) ioctlsocket(sk, FIONBIO, &nb);
+    return sk;
+}
 
 bool g_ears_dll = false;                                      // EDITH.ini ears=dll: her ears are built in (edith_ears.cpp)
 
@@ -971,27 +985,20 @@ void Event(const char *fmt, ...) {
     va_end(a);
     if (n <= 0) return;
     if (g_ears_dll) Ears_Line(buf);                           // up to the brain
-    if (g_sock != INVALID_SOCKET)                             // (and to a Python companion, if one runs)
-        sendto(g_sock, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1, 0, (sockaddr *)&g_ai, sizeof g_ai);
+    if (g_ev_sock != INVALID_SOCKET)                          // (and to a Python companion, if one runs)
+        sendto(g_ev_sock, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1, 0, (sockaddr *)&g_ai, sizeof g_ai);
 }
 
 void OpenOrders() {
-    WSADATA w;
-    if (WSAStartup(MAKEWORD(2, 2), &w)) return;
-    SOCKET sk = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    SOCKET sk = UdpSocket();
     if (sk == INVALID_SOCKET) return;
     sockaddr_in me = {};
     me.sin_family = AF_INET;
     me.sin_port = htons(CMD_PORT);
     inet_pton(AF_INET, "127.0.0.1", &me.sin_addr);
     if (bind(sk, (sockaddr *)&me, sizeof me)) { Log("orders: port %u busy", CMD_PORT); closesocket(sk); return; }
-    u_long nb = 1;
-    ioctlsocket(sk, FIONBIO, &nb);
-    g_ai.sin_family = AF_INET;
-    g_ai.sin_port = htons(EVENT_PORT);
-    inet_pton(AF_INET, "127.0.0.1", &g_ai.sin_addr);
     g_sock = sk;
-    Log("orders: listening on 127.0.0.1:%u, events to :%u", CMD_PORT, EVENT_PORT);
+    Log("orders: listening on 127.0.0.1:%u", CMD_PORT);
 }
 
 bool SetFace(const char *name, float seconds);                // her mood faces (below)
@@ -2407,9 +2414,7 @@ constexpr u_short SELF_PORT = 47325;
 SOCKET g_self = INVALID_SOCKET;
 void OpenSelf() {
     if (g_server) return;
-    WSADATA w;
-    WSAStartup(MAKEWORD(2, 2), &w);
-    SOCKET sk = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    SOCKET sk = UdpSocket();
     sockaddr_in a = {};
     a.sin_family = AF_INET;
     a.sin_port = htons(SELF_PORT);
@@ -2419,8 +2424,6 @@ void OpenSelf() {
         if (sk != INVALID_SOCKET) closesocket(sk);
         return;
     }
-    u_long nb = 1;
-    ioctlsocket(sk, FIONBIO, &nb);
     g_self = sk;
     Log("self: push / shutdown for your own body on 127.0.0.1:%u", SELF_PORT);
 }
@@ -3172,9 +3175,7 @@ bool VoipInstall(uint8_t *base) {
         Log("voip: the registry or Wwise queries aren't as expected: she can't hear voice chat");
         return false;
     }
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-    g_voip_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    g_voip_sock = UdpSocket();                                // (Wwise's audio thread sends on it)
     g_voip_to.sin_family = AF_INET;
     g_voip_to.sin_port = htons(VOIP_PORT);
     inet_pton(AF_INET, "127.0.0.1", &g_voip_to.sin_addr);
@@ -3209,7 +3210,7 @@ const char *EarsMe() { return g_me; }
 void EarsOrder(const char *order) {
     if (!strncmp(order, "heard ", 6)) { ForwardHeard(order + 6); return; }
     if (!strncmp(order, "voice ", 6)) { SendVoice(order + 6); return; }
-    static SOCKET sk = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    static SOCKET sk = UdpSocket();
     std::string o = order, to;
     size_t t = o.find(" to=");
     if (t != std::string::npos) { to = o.substr(t + 4); to = to.substr(0, to.find(' ')); }
@@ -3382,14 +3383,11 @@ DWORD WINAPI Install(LPVOID) {
     LONG rc = DetourTransactionCommit();
     if (g_authority || g_local) OpenOrders();
     OpenSelf();
-    if (g_sock == INVALID_SOCKET) {                          // not steering her here: events only (your mute)
-        WSADATA w;
-        WSAStartup(MAKEWORD(2, 2), &w);
-        g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        g_ai.sin_family = AF_INET;
-        g_ai.sin_port = htons(EVENT_PORT);
-        inet_pton(AF_INET, "127.0.0.1", &g_ai.sin_addr);
-    }
+    g_ev_sock = UdpSocket();                                  // events go out whether or not orders come in here
+    g_ai.sin_family = AF_INET;
+    g_ai.sin_port = htons(EVENT_PORT);
+    inet_pton(AF_INET, "127.0.0.1", &g_ai.sin_addr);
+    Log("events: to 127.0.0.1:%u", EVENT_PORT);
     if (g_ears_dll) StartEars();
     Log("hooked CTransformCS::get + CR15NetGame::Update: %ld (%s)", rc, g_authority ? "authority: she is steered here" : g_local ? "local mode: steered on this client, following you" : "not authority: idle");
     return 0;

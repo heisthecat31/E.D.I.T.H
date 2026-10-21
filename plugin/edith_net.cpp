@@ -152,6 +152,7 @@ static void Main() {
         }
         HINTERNET s = WinHttpOpen(L"EdithSatellite/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
                                   WINHTTP_NO_PROXY_BYPASS, 0);
+        if (s) WinHttpSetTimeouts(s, 5000, 5000, 10000, 30000);  // (an unreachable relay: give up and retry, never hang)
         HINTERNET c = s ? WinHttpConnect(s, host.c_str(), port, 0) : nullptr;
         HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
                                              WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0) : nullptr;
