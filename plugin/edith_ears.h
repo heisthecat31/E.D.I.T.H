@@ -1,6 +1,6 @@
 // E.D.I.T.H's ears and mouth inside the DLL (docs/brainplan.md "Built-in ears"): what
 // ai/edith_ears.py does, without Python, so every player's game can host her and talk with her.
-//   brain link: one WebSocket to the brain (Railway/SparkAPI edith_brain.py, /edith/brain)
+//   brain link: one WebSocket to the brain (E.D.I.T.H-AI edith_brain.py, edith.echovr.de/edith/brain)
 //   up:   every event line the DLL makes ({"t":"dll"}), your mic's speech and the room's voice chat
 //         (EDA1 utterances, int16 mono 16 kHz)
 //   down: replies (face, orders, her line) -> the DLL; her line from the voice pack or streamed

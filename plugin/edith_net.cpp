@@ -1,4 +1,4 @@
-// Edith networking: a WinHTTP WebSocket client to the relay (Railway/SparkAPI edith_relay.py).
+// Edith networking: a WinHTTP WebSocket client to the relay (E.D.I.T.H-AI edith_relay.py, edith.echovr.de).
 // The same shape as EchoXR-Hands' htv_net.cpp: one thread connects and sends, a second receives,
 // both stop on error and the first reconnects with backoff. WinHTTP ships with Windows.
 //

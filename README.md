@@ -4,7 +4,7 @@
 
 The Christmas CubeSat brought back into Echo VR's live lobby as **E.D.I.T.H**, "the new AI for the
 Echo Construct": she flies, follows, tumbles, stares, throws balls at people who throw her, shoves and
-shuts down bullies, changes face with her mood, and talks (her brain runs on SparkAPI; see `docs/`).
+shuts down bullies, changes face with her mood, and talks (her brain runs on E.D.I.T.H-AI at edith.echovr.de; see `docs/`).
 One Edith per match: players with the mod share her through the relay (`docs/networkplan.md`).
 
 | Happy | Surprised | Angry |

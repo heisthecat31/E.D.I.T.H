@@ -1,5 +1,5 @@
 """Edith's ears and mouth on this PC: the thin companion. Her brain runs on the server
-(Railway/SparkAPI/edith_brain.py; docs/brainplan.md).
+(E.D.I.T.H-AI edith_brain.py at edith.echovr.de; docs/brainplan.md).
 
     H:\\SatelliteAI\\venv\\Scripts\\python.exe -I ai/edith_ears.py            # run alongside the game
     ... ai/edith_ears.py --text "edith, come here"                         # no mic: one line, for testing
@@ -36,7 +36,7 @@ ROOT = Path(os.environ.get("SATELLITE_AI", r"H:\SatelliteAI"))
 CONFIG = ROOT / "config.json"
 BUILD = "ears-1"
 DEFAULTS = {
-    "brain": "wss://sparkapi-production-e6df.up.railway.app/edith/brain",
+    "brain": "wss://edith.echovr.de/edith/brain",
     "voice_pack": "",                     # "" = the game's plugins\EdithVoice (else H:\SatelliteAI\voicecache)
     "voice_out": "auto",                  # auto (her speaker in game when it's on, else local) | game | local
     "hear_voip": True,                    # other players on voice chat (EDITH.dll, UDP 47324)

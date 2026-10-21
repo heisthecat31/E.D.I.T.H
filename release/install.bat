@@ -1,8 +1,8 @@
 @echo off
 rem E.D.I.T.H installer: finds Echo VR (Spark's settings, else asks), then puts EDITH.dll into its
 rem plugins folder. EDITH.dll is all of her (voice, lobby data, settings) and runs under nEVR and under
-rem the plain plugin loader alike: with nEVR it turns on nEVR's local plugins (x-local-plugins: true in
-rem _local\config.yaml) so the launcher loads her; without nEVR it adds the plugin loader if there's none.
+rem the plain plugin loader alike: with nEVR it only puts her into nEVR's plugins folder and says she
+rem won't load until nEVR knows about her; without nEVR it adds the plugin loader if there's none.
 setlocal EnableExtensions EnableDelayedExpansion
 rem Windows' own tools by full path: a PATH with Git's Unix tools first made "find /i" crawl the I: drive
 set "SYS=%SystemRoot%\System32"
@@ -80,22 +80,9 @@ if exist "%GAME%\BugSplat64.dll" (
 if not exist "%GAME%\plugins\" mkdir "%GAME%\plugins" || goto :copyfail
 
 if "%NEVR%"=="1" (
-    rem nEVR loads only the plugins its config lists; the launcher writes that config before every
-    rem start and keeps a DLL put into plugins\ by hand only with local plugins on
-    echo   nEVR is installed: E.D.I.T.H runs as an nEVR plugin.
-    for %%R in ("%GAME%\..\..") do set "ROOT=%%~fR"
-    if not exist "!ROOT!\_local\" mkdir "!ROOT!\_local"
-    set "CFG=!ROOT!\_local\config.yaml"
-    "%SYS%\findstr.exe" /r /c:"^x-local-plugins: *true" "!CFG!" >nul 2>nul
-    if errorlevel 1 (
-        if exist "!CFG!" (
-            copy /y "!CFG!" "!CFG!.edith-backup" >nul
-            ( echo x-local-plugins: true& type "!CFG!.edith-backup" ) > "!CFG!" || goto :copyfail
-        ) else (
-            ( echo x-local-plugins: true ) > "!CFG!" || goto :copyfail
-        )
-        echo   Turned on nEVR's local plugins ^(x-local-plugins: true in _local\config.yaml^).
-    )
+    rem nEVR loads only the plugins it knows (its config, which the launcher writes): she goes into
+    rem its plugins folder and nothing else is touched, no loader and no nEVR config
+    echo   nEVR is installed: E.D.I.T.H goes into its plugins folder, nothing else is changed.
 ) else (
     rem ---- the plugin loader: bin\win10\dbgcore.dll (the game loads it itself) ------------------
     if not exist "%GAME%\dbgcore.dll" (
@@ -114,8 +101,15 @@ rem plugins\EDITH\*.edith would be loaded over the built-in one
 if exist "%P%\EDITH\" rd /s /q "%P%\EDITH"
 if exist "%P%\EdithVoice\" rd /s /q "%P%\EdithVoice"
 echo.
-echo   Done. E.D.I.T.H is installed: start Echo VR and go to the lobby.
-if "%NEVR%"=="1" echo   ^(Start it from the Echo VR launcher as usual; she shows on its Mods page as a local plugin.^)
+if "%NEVR%"=="1" (
+    echo   Done. EDITH.dll is in nEVR's plugins folder:
+    echo     !P!\EDITH.dll
+    echo.
+    echo   She WON'T load yet: nEVR only loads the plugins it knows about, and it doesn't know
+    echo   about her until she's added to nEVR ^(through the Echo VR launcher^).
+) else (
+    echo   Done. E.D.I.T.H is installed: start Echo VR and go to the lobby.
+)
 echo.
 pause
 exit /b 0

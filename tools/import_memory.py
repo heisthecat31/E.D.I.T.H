@@ -1,7 +1,7 @@
 """Move the old local memory (H:\\SatelliteAI\\memory.json) into her brain on the server, as one
 player's record (docs/brainplan.md). Their profile, notes, places, what they taught her, events.
 
-    python tools/import_memory.py --name "<in-game name>" --brain https://sparkapi-production-e6df.up.railway.app
+    python tools/import_memory.py --name "<in-game name>" --brain https://edith.echovr.de
     (the admin token comes from the EDITH_ADMIN_TOKEN environment variable, never the command line)
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
-    ap.add_argument("--brain", default="https://sparkapi-production-e6df.up.railway.app")
+    ap.add_argument("--brain", default="https://edith.echovr.de")
     ap.add_argument("--memory", default=r"H:\SatelliteAI\memory.json")
     a = ap.parse_args()
     token = os.environ.get("EDITH_ADMIN_TOKEN")

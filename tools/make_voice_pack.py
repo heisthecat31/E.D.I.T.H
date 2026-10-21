@@ -5,8 +5,8 @@ cloned-voice renders (docs/brainplan.md). Ships as plugins\\EdithVoice\\<key>.pc
     H:\\SatelliteAI\\venv\\Scripts\\python.exe -I tools/make_voice_pack.py [--out DIR] [--install]
         --install    also copy it into the game's plugins folder (both installs, when present)
 
-Keys are the brain's (Railway/SparkAPI/edith_brain.py voice_key: sha1 of voice|speed|text): every
-line in her live library (Railway/SparkAPI/edith_library), its sentences, what she was taught
+Keys are the brain's (E.D.I.T.H-AI/edith_brain.py voice_key: sha1 of voice|speed|text): every
+line in her live library (E.D.I.T.H-AI/edith_library), its sentences, what she was taught
 (H:\\SatelliteAI\\memory.json), and H:\\SatelliteAI\\lines.txt, in her voice and the fallback voice.
 A cache file no known line maps to is left out (old voices, old speeds); --unmapped keeps them.
 """
@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
-SPARK = HERE.parent / "Railway" / "SparkAPI"
+BRAIN = HERE.parent / "E.D.I.T.H-AI"
 ROOT = Path(os.environ.get("SATELLITE_AI", r"H:\SatelliteAI"))
 GAMES = [Path(r"C:\Oculus\Games\Software\Software\ready-at-dawn-echo-arena\bin\win10\plugins"),
          Path(r"H:\ready-at-dawn-echo-arena\bin\win10\plugins")]
@@ -37,8 +37,8 @@ def main() -> int:
     a = ap.parse_args()
 
     os.environ.update(EDITH_STT="0", EDITH_TTS="0", DATA_DIR=tempfile.mkdtemp(prefix="edithpack"),
-                      EDITH_LIBRARY=str(SPARK / "edith_library"))
-    sys.path.insert(0, str(SPARK))
+                      EDITH_LIBRARY=str(BRAIN / "edith_library"))
+    sys.path.insert(0, str(BRAIN))
     import edith_brain as b                                       # noqa: E402
 
     lib = b.LIB.get()

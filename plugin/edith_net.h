@@ -1,4 +1,4 @@
-// Edith networking: one shared satellite per match, through the relay (Railway/SparkAPI
+// Edith networking: one shared satellite per match, through the relay (E.D.I.T.H-AI,
 // edith_relay.py) over one WebSocket. docs/networkplan.md has the design and the messages.
 #pragma once
 #include <stdint.h>

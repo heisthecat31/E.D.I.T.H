@@ -2006,7 +2006,7 @@ void UpdateFaces() {
 }
 
 // --- Edith on the network (docs/networkplan.md) --------------------------------------------------
-// One Edith per match: every client with the plugin keeps a WebSocket to the relay (Railway/SparkAPI
+// One Edith per match: every client with the plugin keeps a WebSocket to the relay (E.D.I.T.H-AI,
 // edith_relay.py), says who it is and who else is in its match, and the relay picks the host.
 // Phase 1 (presence): hello + room, logged and on the state line. Phases 2-3 (one body, hands on) and
 // 5 (other players' speech reaching the host): below UpdateNet. Her ears on voice chat: UpdateVoip.
@@ -2016,7 +2016,7 @@ constexpr uintptr_t GET_USERNAME_RVA = 0x1c98c0;
 constexpr uint8_t GET_USERNAME_BYTES[] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0x0f, 0xb7 };
 using get_username_fn = const char *(__fastcall *)(uint8_t *ng, uint16_t slot);
 get_username_fn GetUserNameFn = nullptr;
-char g_relay[256] = "wss://sparkapi-production-e6df.up.railway.app/edith/ws";
+char g_relay[256] = "wss://edith.echovr.de/edith/ws";
 char g_my_name[64] = "";
 char g_debug_roster[256] = "";                                // (testing) names added to your match's roster
 constexpr const char *NET_BUILD = "sat-p3";
@@ -3185,7 +3185,7 @@ bool VoipInstall(uint8_t *base) {
 }
 
 // ---- her built-in ears (edith_ears.cpp): what they ask of the DLL ----------------------------------
-char g_brain_url[256] = "wss://sparkapi-production-e6df.up.railway.app/edith/brain";
+char g_brain_url[256] = "wss://edith.echovr.de/edith/brain";
 char g_mic[32] = "default";
 bool EarsInLobby() { return g_her_pos_ok != 0 && g_spawned; }   // (her ears wait for your spawn)
 bool EarsMuted() { return g_muted == 1; }
